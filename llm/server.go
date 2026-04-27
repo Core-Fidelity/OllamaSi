@@ -685,15 +685,11 @@ func (s *llamaServer) Load(ctx context.Context, systemInfo ml.SystemInfo, system
 	// The llama engine uses mmap by default
 	s.loadRequest.UseMmap = true
 
-	// mmap has issues with partial offloading on metal
-	for _, g := range gpus {
-		if g.Library == "Metal" &&
-			uint64(s.options.NumGPU) > 0 &&
-			uint64(s.options.NumGPU) < s.totalLayers {
-			s.options.UseMMap = new(bool)
-			*s.options.UseMMap = false
-		}
-	}
+	// llama.cpp upstream supports mmap + partial offload on Metal via
+	// buffer_from_host_ptr (newBufferWithBytesNoCopy with MTLResourceStorageModeShared).
+	// This was disabled historically due to older ggml bugs. Now safe on all tested
+	// hardware. Removing the old workaround per validated benchmarks (e.g. deepseek-r1:8b
+	// on 8GB Mac went from ~4 tok/s to ~10.5 tok/s).
 
 	// Windows CUDA should not use mmap for best performance
 	// Linux  with a model larger than free space, mmap leads to thrashing

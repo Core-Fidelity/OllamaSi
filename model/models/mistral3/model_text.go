@@ -9,6 +9,7 @@ import (
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/ml/nn"
 	"github.com/ollama/ollama/ml/nn/rope"
+	"github.com/ollama/ollama/model"
 	"github.com/ollama/ollama/model/input"
 )
 
@@ -144,7 +145,9 @@ func (m *TextModel) Forward(ctx ml.Context, inputs, positions, positionsScale, o
 			lastLayerOutputs = outputs
 		}
 
-		hiddenState = layer.Forward(ctx, hiddenState, positions, positionsScale, lastLayerOutputs, cache, m.TextOptions)
+		model.TraceLayer("mistral3_text", i, batch, func() {
+			hiddenState = layer.Forward(ctx, hiddenState, positions, positionsScale, lastLayerOutputs, cache, m.TextOptions)
+		})
 	}
 
 	hiddenState = m.OutputNorm.Forward(ctx, hiddenState, m.eps)

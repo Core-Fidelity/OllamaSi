@@ -208,7 +208,9 @@ func (m *Model) Forward(ctx ml.Context, batch input.Batch) (ml.Tensor, error) {
 			outputs = batch.Outputs
 		}
 
-		hiddenState = layer.Forward(ctx, hiddenState, positions, outputs, m.Cache, m, isSWA)
+		model.TraceLayer("olmo3", i, batch, func() {
+			hiddenState = layer.Forward(ctx, hiddenState, positions, outputs, m.Cache, m, isSWA)
+		})
 	}
 
 	hiddenState = m.OutputNorm.Forward(ctx, hiddenState, m.eps)

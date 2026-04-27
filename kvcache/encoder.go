@@ -143,6 +143,16 @@ func (c *EncoderCache) CopyPrefix(srcSeq, dstSeq int, len int32) {
 	panic("encoder cache does not support multiple sequences")
 }
 
+func (c *EncoderCache) SetPrefixSize(seq int, size int32) {}
+
+func (c *EncoderCache) SavePrefixData(seqId int, numKeep int32) (keys [][]byte, vals [][]byte, err error) {
+	return nil, nil, ErrNotSupported
+}
+
+func (c *EncoderCache) LoadPrefixData(seqId int, numKeep int32, keys [][]byte, vals [][]byte) error {
+	return ErrNotSupported
+}
+
 func (c *EncoderCache) CanResume(seq int, pos int32) bool {
 	return true
 }

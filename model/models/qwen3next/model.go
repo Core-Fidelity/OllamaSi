@@ -400,7 +400,9 @@ func (m *Model) Forward(ctx ml.Context, batch input.Batch) (ml.Tensor, error) {
 			}
 
 			var err error
-			hiddenStates, err = layer.Forward(ctx, i, hiddenStates, positions, outputs, cache, m.Options)
+			model.TraceLayer("qwen35", i, batch, func() {
+				hiddenStates, err = layer.Forward(ctx, i, hiddenStates, positions, outputs, cache, m.Options)
+			})
 			if err != nil {
 				return nil, err
 			}
@@ -427,7 +429,9 @@ func (m *Model) Forward(ctx ml.Context, batch input.Batch) (ml.Tensor, error) {
 		}
 
 		var err error
-		hiddenStates, err = layer.Forward(ctx, i, hiddenStates, positions, outputs, cache, m.Options)
+		model.TraceLayer("qwen35", i, batch, func() {
+			hiddenStates, err = layer.Forward(ctx, i, hiddenStates, positions, outputs, cache, m.Options)
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -701,7 +705,7 @@ func New(c fs.Config) (model.Model, error) {
 		spatialMergeSize: spatialMergeSize,
 	}
 
-	m.Cache = NewHybridCache(m.Shift, convDim, convChannels, deltaStateSize)
+	m.Cache = NewHybridCache(m.Shift, convDim, convChannels, deltaStateSize, opts.isRecurrent)
 	return &m, nil
 }
 

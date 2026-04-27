@@ -1,10 +1,23 @@
 #import <Foundation/Foundation.h>
 #import <mach/mach.h>
+#import <Metal/Metal.h>
 #include "gpu_info_darwin.h"
 
 uint64_t getRecommendedMaxVRAM() {
   id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+  if (device == nil) return 0;
   uint64_t result = device.recommendedMaxWorkingSetSize;
+  CFRelease(device);
+  return result;
+}
+
+uint64_t getCurrentAllocatedVRAM() {
+  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+  if (device == nil) return 0;
+  uint64_t result = 0;
+  if (@available(macOS 10.12, iOS 16.0, *)) {
+    result = device.currentAllocatedSize;
+  }
   CFRelease(device);
   return result;
 }

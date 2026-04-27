@@ -8,6 +8,7 @@ import (
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/ml/nn"
 	"github.com/ollama/ollama/ml/nn/rope"
+	"github.com/ollama/ollama/model"
 	"github.com/ollama/ollama/model/input"
 )
 
@@ -220,7 +221,9 @@ func (m *TextModel) Forward(ctx ml.Context, batch input.Batch, cache kvcache.Cac
 			cache.SetLayer(donorLayer)
 			isShared = true
 		}
-		hiddenState = layer.Forward(ctx, i, hiddenState, positions, perLayerInput, lastLayerOutputs, cache, isShared, &m.TextOptions)
+		model.TraceLayer("gemma4_text", i, batch, func() {
+			hiddenState = layer.Forward(ctx, i, hiddenState, positions, perLayerInput, lastLayerOutputs, cache, isShared, &m.TextOptions)
+		})
 	}
 
 	return m.OutputNorm.Forward(ctx, hiddenState, m.eps)

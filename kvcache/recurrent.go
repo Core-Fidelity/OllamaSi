@@ -443,6 +443,120 @@ func (c *Recurrent) CopyPrefix(srcSeq, dstSeq int, prefixLen int32) {
 	}
 }
 
+func (c *Recurrent) SetPrefixSize(seq int, size int32) {
+	c.kv.SetPrefixSize(seq, size)
+}
+
+// SaveRecurrentState extracts the conv state and recurrent (delta) state
+// for all recurrent layers that have been allocated. keys[layer] = conv state
+// for the sequence's slot, vals[layer] = delta state for the sequence's slot.
+// Layers without allocated state produce nil entries.
+func (c *Recurrent) SaveRecurrentState(seqId int) (keys [][]byte, vals [][]byte, err error) {
+	slot, ok := c.slotForSeq[seqId]
+	if !ok {
+		return nil, nil, fmt.Errorf("prefix cache: no slot for sequence %d", seqId)
+	}
+	if !c.validSlot(slot) {
+		return nil, nil, fmt.Errorf("prefix cache: invalid slot %d for sequence %d", slot, seqId)
+	}
+
+	// Determine the set of recurrent layers that have state allocated.
+	numRecurrentLayers := maxLayerKey(c.convStates, c.recurrentStates)
+	if numRecurrentLayers == 0 {
+		return nil, nil, nil
+	}
+
+	keys = make([][]byte, numRecurrentLayers)
+	vals = make([][]byte, numRecurrentLayers)
+
+	// Extract conv state and delta state for recurrent layers directly from
+	// GPU buffers using the same gatherRows approach as Causal.SavePrefixData.
+	for layer := 0; layer < numRecurrentLayers; layer++ {
+		if convBuf, ok := c.convStates[layer]; ok {
+			convData := convBuf.Bytes()
+			rowSize := len(convData) / c.maxSequences
+			keys[layer] = gatherRows(convData, []int{slot}, rowSize)
+		}
+
+		if recurBuf, ok := c.recurrentStates[layer]; ok {
+			recurData := recurBuf.Bytes()
+			rowSize := len(recurData) / c.maxSequences
+			vals[layer] = gatherRows(recurData, []int{slot}, rowSize)
+		}
+	}
+
+	return keys, vals, nil
+}
+
+// LoadRecurrentState restores conv state and delta state for all recurrent
+// layers. It allocates a slot for the sequence if one doesn't exist.
+func (c *Recurrent) LoadRecurrentState(seqId int, keys [][]byte, vals [][]byte) error {
+	if len(keys) != len(vals) {
+		return fmt.Errorf("prefix cache recurrent: key/value layer mismatch: %d != %d", len(keys), len(vals))
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+
+	// Allocate or reuse a slot for this sequence.
+	slot, ok := c.slotForSeq[seqId]
+	if !ok {
+		var err error
+		slot, err = c.allocSlot()
+		if err != nil {
+			return fmt.Errorf("prefix cache recurrent: %w", err)
+		}
+		c.slotForSeq[seqId] = slot
+		c.refCount[slot] = 1
+	} else if c.refCount[slot] > 1 {
+		// Slot is shared (copy-on-write); allocate a private copy.
+		newSlot, err := c.allocSlot()
+		if err != nil {
+			return fmt.Errorf("prefix cache recurrent: %w", err)
+		}
+		c.refCount[slot]--
+		slot = newSlot
+		c.slotForSeq[seqId] = slot
+		c.refCount[slot] = 1
+	}
+
+	for layer := 0; layer < len(keys); layer++ {
+		if keys[layer] != nil {
+			// Force allocation if not yet created.
+			convBuf := c.convBuffer(layer)
+			convData := convBuf.Bytes()
+			convRowBytes := len(convData) / c.maxSequences
+			if len(keys[layer]) != convRowBytes {
+				return fmt.Errorf("prefix cache recurrent: conv state layer %d size mismatch: got %d, want %d", layer, len(keys[layer]), convRowBytes)
+			}
+			copy(convData[slot*convRowBytes:(slot+1)*convRowBytes], keys[layer])
+			convBuf.FromBytes(convData)
+		}
+
+		if vals[layer] != nil {
+			// Force allocation if not yet created.
+			recurBuf := c.recurrentBuffer(layer)
+			recurData := recurBuf.Bytes()
+			recurRowBytes := len(recurData) / c.maxSequences
+			if len(vals[layer]) != recurRowBytes {
+				return fmt.Errorf("prefix cache recurrent: delta state layer %d size mismatch: got %d, want %d", layer, len(vals[layer]), recurRowBytes)
+			}
+			copy(recurData[slot*recurRowBytes:(slot+1)*recurRowBytes], vals[layer])
+			recurBuf.FromBytes(recurData)
+		}
+	}
+
+	return nil
+}
+
+func (c *Recurrent) SavePrefixData(seqId int, numKeep int32) (keys [][]byte, vals [][]byte, err error) {
+	return nil, nil, ErrNotSupported
+}
+
+func (c *Recurrent) LoadPrefixData(seqId int, numKeep int32, keys [][]byte, vals [][]byte) error {
+	return ErrNotSupported
+}
+
 func (c *Recurrent) CanResume(seq int, pos int32) bool {
 	if !c.kv.CanResume(seq, pos) {
 		return false
@@ -581,6 +695,26 @@ func (c *Recurrent) NumSeqs() int {
 	return len(c.curSeqs)
 }
 
+// maxLayerKey returns the maximum layer index present across both maps plus one,
+// or 0 if both maps are empty.
+func maxLayerKey(a, b map[int]ml.Tensor) int {
+	maxIdx := -1
+	for k := range a {
+		if k > maxIdx {
+			maxIdx = k
+		}
+	}
+	for k := range b {
+		if k > maxIdx {
+			maxIdx = k
+		}
+	}
+	if maxIdx < 0 {
+		return 0
+	}
+	return maxIdx + 1
+}
+
 func (c *Recurrent) convBuffer(layer int) ml.Tensor {
 	if buf, ok := c.convStates[layer]; ok {
 		return buf
@@ -655,6 +789,12 @@ func (c *Recurrent) ensureWritableOnce(ctx ml.Context) {
 		}
 		c.writableEnsured = true
 	}
+}
+
+// KV returns the underlying causal cache for hybrid cache implementations
+// that need to save/load causal K/V data separately from recurrent state.
+func (c *Recurrent) KV() *Causal {
+	return c.kv
 }
 
 // ConvState returns conv state for current batch sequences as [convDim, convChannels, nSeqs].

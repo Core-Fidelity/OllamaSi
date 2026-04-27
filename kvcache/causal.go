@@ -62,6 +62,10 @@ type Causal struct {
 
 	// ** cache metadata **
 
+	// prefixSize maps sequence id -> boundary between immutable prefix [0, size)
+	// and mutable tail [size, ...). Prefix cells are never shifted or evicted.
+	prefixSizes map[int]int32
+
 	// for each possible location in the cache, stores the position and set of sequences
 	// that reference the data there
 	cells []cacheCell
@@ -89,10 +93,11 @@ type cellRange struct {
 
 func NewCausalCache(shift shiftFn) *Causal {
 	return &Causal{
-		shiftFn: shift,
-		ctxs:    make(map[int]ml.Context),
-		keys:    make(map[int]ml.Tensor),
-		values:  make(map[int]ml.Tensor),
+		shiftFn:     shift,
+		prefixSizes: make(map[int]int32),
+		ctxs:        make(map[int]ml.Context),
+		keys:        make(map[int]ml.Tensor),
+		values:      make(map[int]ml.Tensor),
 	}
 }
 
@@ -100,6 +105,7 @@ func NewSWACache(windowSize int32, shift shiftFn) *Causal {
 	return &Causal{
 		swaWindowSize: windowSize,
 		shiftFn:       shift,
+		prefixSizes:   make(map[int]int32),
 		ctxs:          make(map[int]ml.Context),
 		keys:          make(map[int]ml.Tensor),
 		values:        make(map[int]ml.Tensor),
@@ -111,6 +117,7 @@ func NewSWAMemCache(windowSize int32, memorySize int32, shift shiftFn) *Causal {
 		swaWindowSize: windowSize,
 		swaMemorySize: memorySize,
 		shiftFn:       shift,
+		prefixSizes:   make(map[int]int32),
 		ctxs:          make(map[int]ml.Context),
 		keys:          make(map[int]ml.Tensor),
 		values:        make(map[int]ml.Tensor),
@@ -119,11 +126,12 @@ func NewSWAMemCache(windowSize int32, memorySize int32, shift shiftFn) *Causal {
 
 func NewChunkedAttentionCache(chunkSize int32, shift shiftFn) *Causal {
 	return &Causal{
-		chunkSize: chunkSize,
-		shiftFn:   shift,
-		ctxs:      make(map[int]ml.Context),
-		keys:      make(map[int]ml.Tensor),
-		values:    make(map[int]ml.Tensor),
+		chunkSize:   chunkSize,
+		shiftFn:     shift,
+		prefixSizes: make(map[int]int32),
+		ctxs:        make(map[int]ml.Context),
+		keys:        make(map[int]ml.Tensor),
+		values:      make(map[int]ml.Tensor),
 	}
 }
 
@@ -331,7 +339,7 @@ func (c *Causal) updateSlidingWindow() {
 
 		for i := oldRange.min; i <= oldRange.max; i++ {
 			if slices.Contains(c.cells[i].sequences, seq) {
-				if c.cells[i].pos < lowest.pos-c.swaMemorySize {
+				if c.cells[i].pos < lowest.pos-c.swaMemorySize && c.cells[i].pos >= c.prefixSizes[seq] {
 					c.cells[i].sequences = slices.DeleteFunc(c.cells[i].sequences, func(s int) bool { return s == seq })
 				} else {
 					newRange.min = min(newRange.min, i)
@@ -496,14 +504,21 @@ func (c *Causal) Put(ctx ml.Context, key, value ml.Tensor) {
 
 func (c *Causal) CopyPrefix(srcSeq, dstSeq int, len int32) {
 	seqRange := newRange()
+	ps := c.prefixSizes[srcSeq]
 
 	for i := range c.cells {
 		// Remove the contents of dstSeq so that we only have the copied prefix, metadata will be reset at the end
 		if slices.Contains(c.cells[i].sequences, dstSeq) {
 			c.cells[i].sequences = slices.DeleteFunc(c.cells[i].sequences, func(s int) bool { return s == dstSeq })
 		}
-
 		if slices.Contains(c.cells[i].sequences, srcSeq) && c.cells[i].pos < len {
+			// Skip cells that belong to the immutable prefix. CopyPrefix
+			// copies only the mutable region [0, prefixSize); anything at
+			// or beyond prefixSize is live state that must not be duplicated
+			// into another sequence.
+			if ps > 0 && c.cells[i].pos >= ps {
+				continue
+			}
 			c.cells[i].sequences = append(c.cells[i].sequences, dstSeq)
 			if i < seqRange.min {
 				seqRange.min = i
@@ -515,6 +530,201 @@ func (c *Causal) CopyPrefix(srcSeq, dstSeq int, len int32) {
 	}
 
 	c.cellRanges[dstSeq] = seqRange
+}
+
+func (c *Causal) SetPrefixSize(seq int, size int32) {
+	if size > c.prefixSizes[seq] {
+		c.prefixSizes[seq] = size
+	}
+}
+
+func (c *Causal) SavePrefixData(seqId int, numKeep int32) (keys [][]byte, vals [][]byte, err error) {
+	if numKeep <= 0 {
+		return nil, nil, nil
+	}
+
+	locs, err := c.prefixLocs(seqId, numKeep)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	numLayers, err := c.numLayers()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	keys = make([][]byte, numLayers)
+	vals = make([][]byte, numLayers)
+	for layer := 0; layer < numLayers; layer++ {
+		key := c.keys[layer]
+		value := c.values[layer]
+		if key == nil || value == nil {
+			// Layer not initialized (e.g., recurrent layer in hybrid model).
+			// Leave as nil — the caller will fill in recurrent state for this layer.
+			continue
+		}
+
+		keyBytes := key.Bytes()
+		valBytes := value.Bytes()
+		keyRowBytes, err := rowBytes(keyBytes, len(c.cells))
+		if err != nil {
+			return nil, nil, err
+		}
+		valRowBytes, err := rowBytes(valBytes, len(c.cells))
+		if err != nil {
+			return nil, nil, err
+		}
+
+		keys[layer] = gatherRows(keyBytes, locs, keyRowBytes)
+		vals[layer] = gatherRows(valBytes, locs, valRowBytes)
+	}
+
+	return keys, vals, nil
+}
+
+func (c *Causal) LoadPrefixData(seqId int, numKeep int32, keys [][]byte, vals [][]byte) error {
+	if numKeep <= 0 {
+		return nil
+	}
+	if len(keys) != len(vals) {
+		return fmt.Errorf("prefix cache key/value layer mismatch: %d != %d", len(keys), len(vals))
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+
+	for i := range c.cells {
+		if slices.Contains(c.cells[i].sequences, seqId) {
+			c.cells[i].sequences = slices.DeleteFunc(c.cells[i].sequences, func(s int) bool { return s == seqId })
+		}
+	}
+	delete(c.cellRanges, seqId)
+	delete(c.prefixSizes, seqId)
+
+	locs := make([]int32, 0, numKeep)
+	seqRange := newRange()
+	for i := range c.cells {
+		if len(c.cells[i].sequences) != 0 {
+			continue
+		}
+
+		pos := int32(len(locs))
+		c.cells[i] = cacheCell{pos: pos, sequences: []int{seqId}}
+		locs = append(locs, int32(i))
+		seqRange.min = min(seqRange.min, i)
+		seqRange.max = max(seqRange.max, i)
+		if int32(len(locs)) >= numKeep {
+			break
+		}
+	}
+
+	if int32(len(locs)) != numKeep {
+		for _, loc := range locs {
+			c.cells[loc] = cacheCell{}
+		}
+		return fmt.Errorf("%w (cache: %v batch: %v)", ErrKvCacheFull, len(c.cells), numKeep)
+	}
+
+	for layer := 0; layer < len(keys); layer++ {
+		key := c.keys[layer]
+		value := c.values[layer]
+		if key == nil || value == nil {
+			// Layer not initialized (e.g., recurrent layer in hybrid model).
+			continue
+		}
+
+		keyData := key.Bytes()
+		valData := value.Bytes()
+		keyRowBytes, err := rowBytes(keyData, len(c.cells))
+		if err != nil {
+			return err
+		}
+		if len(keys[layer]) != keyRowBytes*int(numKeep) {
+			return fmt.Errorf("prefix cache key layer %d size mismatch: %d != %d", layer, len(keys[layer]), keyRowBytes*int(numKeep))
+		}
+		if err := scatterRows(keyData, keys[layer], locs, keyRowBytes); err != nil {
+			return err
+		}
+		key.FromBytes(keyData)
+
+		valRowBytes, err := rowBytes(valData, len(c.cells))
+		if err != nil {
+			return err
+		}
+		if len(vals[layer]) != valRowBytes*int(numKeep) {
+			return fmt.Errorf("prefix cache value layer %d size mismatch: %d != %d", layer, len(vals[layer]), valRowBytes*int(numKeep))
+		}
+		if err := scatterRows(valData, vals[layer], locs, valRowBytes); err != nil {
+			return err
+		}
+		value.FromBytes(valData)
+	}
+
+	c.cellRanges[seqId] = seqRange
+	c.SetPrefixSize(seqId, numKeep)
+
+	return nil
+}
+
+func (c *Causal) prefixLocs(seqId int, numKeep int32) ([]int, error) {
+	locs := make([]int, int(numKeep))
+	for i := range locs {
+		locs[i] = -1
+	}
+
+	for i, cell := range c.cells {
+		if !slices.Contains(cell.sequences, seqId) || cell.pos < 0 || cell.pos >= numKeep {
+			continue
+		}
+		locs[cell.pos] = i
+	}
+
+	for pos, loc := range locs {
+		if loc < 0 {
+			return nil, fmt.Errorf("missing prefix cache cell for seq %d position %d", seqId, pos)
+		}
+	}
+
+	return locs, nil
+}
+
+func (c *Causal) numLayers() (int, error) {
+	numLayers := 0
+	for layer := range c.keys {
+		numLayers = max(numLayers, layer+1)
+	}
+	for layer := range c.values {
+		numLayers = max(numLayers, layer+1)
+	}
+	if numLayers == 0 {
+		return 0, errors.New("prefix cache has no layers")
+	}
+	return numLayers, nil
+}
+
+func rowBytes(data []byte, rows int) (int, error) {
+	if rows <= 0 || len(data)%rows != 0 {
+		return 0, fmt.Errorf("invalid row sizing: len=%d rows=%d", len(data), rows)
+	}
+	return len(data) / rows, nil
+}
+
+func gatherRows(src []byte, locs []int, rowBytes int) []byte {
+	dst := make([]byte, rowBytes*len(locs))
+	for i, loc := range locs {
+		copy(dst[i*rowBytes:(i+1)*rowBytes], src[loc*rowBytes:(loc+1)*rowBytes])
+	}
+	return dst
+}
+
+func scatterRows(dst []byte, src []byte, locs []int32, rowBytes int) error {
+	if len(src) != rowBytes*len(locs) {
+		return fmt.Errorf("scatterRows size mismatch: src=%d rowBytes=%d locs=%d", len(src), rowBytes, len(locs))
+	}
+	for i, loc := range locs {
+		copy(dst[int(loc)*rowBytes:(int(loc)+1)*rowBytes], src[i*rowBytes:(i+1)*rowBytes])
+	}
+	return nil
 }
 
 func (c *Causal) CanResume(seq int, pos int32) bool {
@@ -563,7 +773,7 @@ func (c *Causal) shift(seq int, beginIndex, offset int32) error {
 		for i := range offsets {
 			cell := c.cells[start+i]
 
-			if slices.Contains(cell.sequences, seq) && cell.pos >= beginIndex {
+			if slices.Contains(cell.sequences, seq) && cell.pos >= beginIndex && cell.pos >= c.prefixSizes[seq] {
 				offsets[i] = offset
 				if batchFirst < 0 {
 					batchFirst = i
@@ -627,23 +837,29 @@ func (c *Causal) Remove(seq int, beginIndex, endIndex int32) error {
 	seqRange := newRange()
 
 	for i := range c.cells {
-		if slices.Contains(c.cells[i].sequences, seq) {
-			if c.cells[i].pos >= beginIndex && c.cells[i].pos < endIndex {
-				c.cells[i].sequences = slices.DeleteFunc(c.cells[i].sequences, func(s int) bool { return s == seq })
-			} else {
-				if c.cells[i].pos >= endIndex {
-					if slices.ContainsFunc(c.cells[i].sequences, func(s int) bool { return s != seq }) {
-						return errors.New("shifting cells shared by multiple sequences not supported")
-					}
-
-					c.cells[i].pos += offset
+		if !slices.Contains(c.cells[i].sequences, seq) {
+			continue
+		}
+		if c.cells[i].pos < c.prefixSizes[seq] {
+			// Immutable prefix: never removed, never shifted, but still tracked
+			seqRange.min = min(seqRange.min, i)
+			seqRange.max = max(seqRange.max, i)
+			continue
+		}
+		if c.cells[i].pos >= beginIndex && c.cells[i].pos < endIndex {
+			c.cells[i].sequences = slices.DeleteFunc(c.cells[i].sequences, func(s int) bool { return s == seq })
+		} else {
+			if c.cells[i].pos >= endIndex {
+				if slices.ContainsFunc(c.cells[i].sequences, func(s int) bool { return s != seq }) {
+					return errors.New("shifting cells shared by multiple sequences not supported")
 				}
-				if i < seqRange.min {
-					seqRange.min = i
-				}
-				if i > seqRange.max {
-					seqRange.max = i
-				}
+				c.cells[i].pos += offset
+			}
+			if i < seqRange.min {
+				seqRange.min = i
+			}
+			if i > seqRange.max {
+				seqRange.max = i
 			}
 		}
 	}

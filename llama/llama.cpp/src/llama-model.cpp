@@ -2354,6 +2354,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s)\n", __func__, ml.use_mmap ? "true" : "false");
 
+    int64_t t_tensors_0 = ggml_time_us();
+    fprintf(stderr, "INSTRUMENT load_tensors: started\n");
+    fflush(stderr);
+
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
     for (auto * dev : devices) {
@@ -6638,6 +6642,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    int64_t t_create_tensors = ggml_time_us();
+    fprintf(stderr, "INSTRUMENT load_tensors: create tensors took %.3f sec\n", (t_create_tensors - t_tensors_0) / 1e6);
+    fflush(stderr);
+
     ml.done_getting_tensors();
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
@@ -6733,6 +6741,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         ctx_buf_maps.emplace_back(ctx, buf_map);
     }
 
+    int64_t t_alloc = ggml_time_us();
+    fprintf(stderr, "INSTRUMENT load_tensors: buffer alloc took %.3f sec\n", (t_alloc - t_create_tensors) / 1e6);
+    fflush(stderr);
+
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
 
@@ -6767,11 +6779,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
+    int64_t t_load_data_0 = ggml_time_us();
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }
+    int64_t t_load_data_1 = ggml_time_us();
+    LLAMA_LOG_INFO("load_tensors: load_all_data took %.3f sec\n", (t_load_data_1 - t_load_data_0) / 1e6);
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {

@@ -38,6 +38,22 @@ type BackendCacheConfig interface {
 	CacheConfig() CacheConfig
 }
 
+// HostPtrValidator is an optional interface that backends using zero-copy host_ptr
+// weight loading should implement. ValidateWeights is called after all memory
+// allocations are complete (model + KV cache + graph) to verify that the GPU can
+// read the weights without corruption. On memory-constrained systems, the OS can
+// evict mmap pages that the GPU references via buffer_from_host_ptr.
+type HostPtrValidator interface {
+	// ValidateWeights reads back tensor data through the GPU and compares against
+	// source. Returns true if weights are intact, false if corrupted (caller should
+	// fall back to copy path by calling ForceCopyPath).
+	ValidateWeights() bool
+
+	// ForceCopyPath tears down the host_ptr buffers, re-allocates with standard
+	// copy-path buffers, and reloads tensor data from the model file.
+	ForceCopyPath() error
+}
+
 // CacheConfig controls optimizations (mostly backend-specific) that may transform
 // the output the cache to work better with specific kernels.
 type CacheConfig struct {

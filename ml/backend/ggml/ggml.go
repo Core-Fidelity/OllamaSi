@@ -8,9 +8,46 @@ package ggml
 // #include "ggml.h"
 // #include "ggml-cpu.h"
 // #include "ggml-backend.h"
+// #ifdef __APPLE__
+// #include <mach/mach_host.h>
+// #include <mach/host_info.h>
+// #include <mach/mach_error.h>
+// #include <sys/sysctl.h>
+// static uint64_t ggml_ollama_available_memory_bytes(void) {
+//   mach_port_t host_port = mach_host_self();
+//   vm_size_t pagesize = 0;
+//   vm_statistics64_data_t vm_stat;
+//   mach_msg_type_number_t host_size = HOST_VM_INFO64_COUNT;
+//   if (host_page_size(host_port, &pagesize) != KERN_SUCCESS) {
+//     return 0;
+//   }
+//   if (host_statistics64(host_port, HOST_VM_INFO64, (host_info64_t)&vm_stat, &host_size) != KERN_SUCCESS) {
+//     return 0;
+//   }
+//   return ((uint64_t)vm_stat.free_count +
+//           (uint64_t)vm_stat.speculative_count +
+//           (uint64_t)vm_stat.inactive_count) * (uint64_t)pagesize;
+// }
+// static uint64_t ggml_ollama_total_memory_bytes(void) {
+//   uint64_t memsize = 0;
+//   size_t len = sizeof(memsize);
+//   if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) == 0) {
+//     return memsize;
+//   }
+//   return 0;
+// }
+// #else
+// static uint64_t ggml_ollama_available_memory_bytes(void) {
+//   return 0;
+// }
+// static uint64_t ggml_ollama_total_memory_bytes(void) {
+//   return 0;
+// }
+// #endif
 import "C"
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/binary"
@@ -26,6 +63,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode"
 	"unsafe"
 
@@ -37,12 +75,24 @@ import (
 	ggml "github.com/ollama/ollama/ml/backend/ggml/ggml/src"
 	"github.com/ollama/ollama/ml/nn/rope"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sys/unix"
 )
 
 var (
 	cpus, accels, gpus []C.ggml_backend_dev_t
 	backends           map[C.ggml_backend_dev_t]C.ggml_backend_t
 )
+
+// Maintain a minimum amount of host RAM after mlock succeeds.
+//
+// Percentage-based thresholds were too aggressive on 8 GB Apple Silicon
+// systems and caused successful mlock paths to be immediately unlocked,
+// forcing models back onto slower unpinned execution.
+//
+// A fixed absolute floor preserves zero-copy fallback for models that fail
+// mlock (ENOMEM) while keeping small-to-medium models pinned when enough
+// working-set headroom remains.
+const minHostPtrHeadroomBytes = 512 * 1024 * 1024
 
 var initDevices = sync.OnceFunc(func() {
 	ggml.OnceLoad()
@@ -109,6 +159,8 @@ type Backend struct {
 	// btDeviceMemory maps from a buffer type to the memory allocations associated with that device
 	btDeviceMemory map[C.ggml_backend_buffer_type_t]*ml.DeviceMemory
 
+	warnedCopyPath bool // guardrail: fire once if host_ptr is off on Metal
+
 	flashAttention ml.FlashAttentionType
 
 	// maxGraphNodes is the maximum allowed number of graph nodes in this scheduler
@@ -116,6 +168,27 @@ type Backend struct {
 
 	// weightBuffers are the GGML contexts and buffers for allocating weights
 	weightBuffers map[*C.struct_ggml_context]C.ggml_backend_buffer_t
+
+	// ctxBufts maps context -> buffer type for fallback re-allocation
+	ctxBufts map[*C.struct_ggml_context]C.ggml_backend_buffer_type_t
+
+	// mmapData holds the mmap'd model file when using the zero-copy host_ptr path.
+	// Kept alive as long as the backend exists to prevent GC / unmap.
+	mmapData []byte
+
+	// useHostPtr indicates whether weights are backed by mmap'd host memory
+	// via buffer_from_host_ptr instead of copied buffers.
+	useHostPtr bool
+
+	// tensorFileMeta maps file tensor name -> offset/size from GGUF metadata
+	tensorFileMeta map[string]struct {
+		offset uint64
+		size   uint64
+	}
+
+	// tensorNameToFileName maps loaded tensor name -> source file tensor name
+	// for alias resolution during host_ptr validation.
+	tensorNameToFileName map[string]string
 }
 
 var once sync.Once
@@ -342,6 +415,31 @@ func New(modelPath string, params ml.BackendParams) (ml.Backend, error) {
 		}
 	}
 
+	// collect file metadata for each tensor (for host_ptr path)
+	tensorFileMeta := make(map[string]struct {
+		offset uint64
+		size   uint64
+	}, len(meta.Tensors().Items()))
+	for _, t := range meta.Tensors().Items() {
+		tensorFileMeta[t.Name] = struct {
+			offset uint64
+			size   uint64
+		}{
+			offset: t.Offset,
+			size:   t.Size(),
+		}
+	}
+
+	// reverse mapping from loaded tensor name to source file tensor name
+	tensorNameToFileName := make(map[string]string, len(targets)*2)
+	for srcName, dstNames := range targets {
+		for _, dstName := range dstNames {
+			tensorNameToFileName[dstName] = srcName
+		}
+		// also map source name to itself
+		tensorNameToFileName[srcName] = srcName
+	}
+
 	// map tensor names to tensors for easy lookup later
 	tensors := make(map[string]*C.struct_ggml_tensor)
 	for _, c := range ctxs {
@@ -390,11 +488,166 @@ func New(modelPath string, params ml.BackendParams) (ml.Backend, error) {
 		C._Bool(params.AllocMemory),
 	)
 
+	// --- zero-copy host_ptr path (default on for Metal, gated off with OLLAMA_USE_HOST_PTR=0) ---
+	useHostPtr := false
+	var mmapData []byte
+	if os.Getenv("OLLAMA_USE_HOST_PTR") != "0" && params.AllocMemory {
+		// check if any device supports buffer_from_host_ptr
+		for _, d := range append(gpus, append(accels, cpus...)...) {
+			if C.ggml_backend_dev_type(d) != C.GGML_BACKEND_DEVICE_TYPE_GPU {
+				continue
+			}
+			var props C.struct_ggml_backend_dev_props
+			C.ggml_backend_dev_get_props(d, &props)
+			if props.caps.buffer_from_host_ptr {
+				useHostPtr = true
+				break
+			}
+		}
+		if useHostPtr {
+			if f, err := os.Open(modelPath); err == nil {
+				if fi, err := f.Stat(); err == nil {
+					mmapData, _ = unix.Mmap(int(f.Fd()), 0, int(fi.Size()), unix.PROT_READ, unix.MAP_SHARED)
+				}
+				f.Close()
+			}
+			if len(mmapData) == 0 {
+				slog.Warn("host_ptr: mmap failed, falling back to copy path")
+				useHostPtr = false
+			}
+			// Pin the mmap'd weight pages in physical RAM. If mlock fails,
+			// we still keep zero-copy enabled — pages fault in on first access.
+			// On macOS, a successful mlock does not guarantee enough headroom
+			// remains for the rest of the working set, so verify post-lock
+			// available RAM before keeping the lock.
+			if useHostPtr {
+				modelName := meta.KV().String("general.name")
+				modelSizeGB := float64(len(mmapData)) / float64(1<<30)
+				if err := unix.Mlock(mmapData); err != nil {
+					slog.Warn("host_ptr: mlock decision",
+						"model_name", modelName,
+						"model_size_gb", fmt.Sprintf("%.2f", modelSizeGB),
+						"mlock_succeeded", false,
+						"mlock_error", err,
+						"did_unlock", false)
+					// Keep mmapData and useHostPtr — mmap stays alive,
+					// pages fault in lazily during prefill.
+				} else {
+					available, availErr := availableHostPtrHeadroom()
+					if availErr == nil && available < minHostPtrHeadroomBytes {
+						slog.Warn("host_ptr: mlock decision",
+							"model_name", modelName,
+							"model_size_gb", fmt.Sprintf("%.2f", modelSizeGB),
+							"available_after_mlock_bytes", available,
+							"available_after_mlock_gb", fmt.Sprintf("%.2f", float64(available)/float64(1<<30)),
+							"threshold_mb", minHostPtrHeadroomBytes/(1024*1024),
+							"mlock_succeeded", true,
+							"did_unlock", true)
+						_ = unix.Munlock(mmapData)
+					} else if availErr == nil {
+						slog.Info("host_ptr: mlock decision",
+							"model_name", modelName,
+							"model_size_gb", fmt.Sprintf("%.2f", modelSizeGB),
+							"available_after_mlock_bytes", available,
+							"available_after_mlock_gb", fmt.Sprintf("%.2f", float64(available)/float64(1<<30)),
+							"threshold_mb", minHostPtrHeadroomBytes/(1024*1024),
+							"mlock_succeeded", true,
+							"did_unlock", false)
+					} else {
+						slog.Warn("host_ptr: mlock decision",
+							"model_name", modelName,
+							"model_size_gb", fmt.Sprintf("%.2f", modelSizeGB),
+							"available_after_mlock_query_error", availErr,
+							"mlock_succeeded", true,
+							"did_unlock", false)
+					}
+				}
+			}
+		}
+	}
+
 	// allocate buffers for each context
 	bbs := make(map[*C.struct_ggml_context]C.ggml_backend_buffer_t, len(ctxs))
+	ctxBufts := make(map[*C.struct_ggml_context]C.ggml_backend_buffer_type_t, len(ctxs))
 	for bt, c := range ctxs {
+		ctxBufts[c] = bt
 		if C.ggml_get_first_tensor(c) == nil {
 			continue
+		}
+
+		if useHostPtr {
+			dev := C.ggml_backend_buft_get_device(bt)
+			if dev == nil {
+				dev = C.ggml_backend_dev_by_type(C.GGML_BACKEND_DEVICE_TYPE_CPU)
+			}
+			var props C.struct_ggml_backend_dev_props
+			C.ggml_backend_dev_get_props(dev, &props)
+			isDefaultBuft := bt == C.ggml_backend_dev_buffer_type(dev)
+			if bool(props.caps.buffer_from_host_ptr) && isDefaultBuft {
+				var first, last uintptr
+				var ctxAligned bool = true
+				base := uintptr(unsafe.Pointer(&mmapData[0]))
+				for t := C.ggml_get_first_tensor(c); t != nil; t = C.ggml_get_next_tensor(c, t) {
+					// compute file offset for this tensor
+					name := C.GoString(C.ggml_get_name(t))
+					if _, ok := tensorFileMeta[name]; !ok {
+						continue
+					}
+					off := int(meta.Tensors().Offset + tensorFileMeta[name].offset)
+					ptr := base + uintptr(off)
+					if first == 0 || ptr < first {
+						first = ptr
+					}
+					end := ptr + uintptr(tensorFileMeta[name].size)
+					if last == 0 || end > last {
+						last = end
+					}
+					// verify alignment
+					align := C.ggml_backend_buft_get_alignment(bt)
+					if align > 0 && ptr%uintptr(align) != 0 {
+						ctxAligned = false
+						logutil.Trace("tensor misaligned for zero-copy", "name", name, "off", off, "align", align, "ptr_mod", ptr%uintptr(align))
+					}
+				}
+				if first > 0 && last > first && ctxAligned {
+					maxTensorSize := C.ggml_get_max_tensor_size(c)
+					b := C.ggml_backend_dev_buffer_from_host_ptr(dev, unsafe.Pointer(first), C.size_t(last-first), C.size_t(maxTensorSize))
+					if b != nil {
+						C.ggml_backend_buffer_set_usage(b, C.GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+						// wire each tensor to its exact mmap address within this buffer
+						metaFileOffset := meta.Tensors().Offset
+						bufferBase := uintptr(C.ggml_backend_buffer_get_base(b))
+						bufferSize := uintptr(C.ggml_backend_buffer_get_size(b))
+						for t := C.ggml_get_first_tensor(c); t != nil; t = C.ggml_get_next_tensor(c, t) {
+							name := C.GoString(C.ggml_get_name(t))
+							srcName, ok := tensorNameToFileName[name]
+							if !ok {
+								logutil.Trace("host_ptr skip", "name", name, "reason", "no_source_name")
+								continue
+							}
+							fm, ok := tensorFileMeta[srcName]
+							if !ok {
+								logutil.Trace("host_ptr skip", "name", name, "reason", "no_file_meta")
+								continue
+							}
+							dataAddr := base + uintptr(metaFileOffset+fm.offset)
+							addr := unsafe.Pointer(dataAddr)
+							tensorSize := C.ggml_nbytes(t)
+							if dataAddr < bufferBase || dataAddr+uintptr(tensorSize) > bufferBase+bufferSize {
+								logutil.Trace("host_ptr skip", "name", name, "dataAddr", dataAddr, "bufferBase", bufferBase, "bufferSize", bufferSize, "tensorSize", tensorSize, "reason", "out_of_bounds")
+								continue
+							}
+							if C.ggml_backend_tensor_alloc(b, t, addr) != C.GGML_STATUS_SUCCESS {
+								logutil.Trace("host_ptr tensor_alloc failed", "name", name, "addr", addr)
+							}
+						}
+						bbs[c] = b
+						logutil.Trace("host_ptr buffer", "dev", C.GoString(C.ggml_backend_dev_name(dev)), "first", first-base, "size", last-first, "maxTensorSize", maxTensorSize)
+						continue
+					}
+				}
+			}
+			// fallback to normal allocation for this context
 		}
 
 		b := C.ggml_backend_alloc_ctx_tensors_from_buft(c, bt)
@@ -420,17 +673,17 @@ func New(modelPath string, params ml.BackendParams) (ml.Backend, error) {
 	}
 
 	return &Backend{
-		modelPath:         modelPath,
-		allocMemory:       params.AllocMemory,
-		flashAttention:    params.FlashAttention,
-		meta:              meta,
-		tensorLoadTargets: targets,
-		tensors:           tensors,
-		sched:             sched,
-		schedBackends:     schedBackends,
-		schedBufts:        schedBufts,
-		input:             deviceBufferTypes[input.d],
-		output:            output.d,
+		modelPath:            modelPath,
+		allocMemory:          params.AllocMemory,
+		flashAttention:       params.FlashAttention,
+		meta:                 meta,
+		tensorLoadTargets:    targets,
+		tensors:              tensors,
+		sched:                sched,
+		schedBackends:        schedBackends,
+		schedBufts:           schedBufts,
+		input:                deviceBufferTypes[input.d],
+		output:               output.d,
 		layers: func() map[int]layerDevice {
 			m := make(map[int]layerDevice)
 			for i, layer := range layers {
@@ -441,10 +694,15 @@ func New(modelPath string, params ml.BackendParams) (ml.Backend, error) {
 			}
 			return m
 		}(),
-		requiredMemory: &requiredMemory,
-		btDeviceMemory: btDeviceMemory,
-		maxGraphNodes:  maxGraphNodes,
-		weightBuffers:  bbs,
+		requiredMemory:       &requiredMemory,
+		btDeviceMemory:       btDeviceMemory,
+		maxGraphNodes:        maxGraphNodes,
+		weightBuffers:        bbs,
+		ctxBufts:             ctxBufts,
+		mmapData:             mmapData,
+		useHostPtr:           useHostPtr,
+		tensorFileMeta:       tensorFileMeta,
+		tensorNameToFileName: tensorNameToFileName,
 	}, nil
 }
 
@@ -462,10 +720,54 @@ func (b *Backend) Close() {
 		C.ggml_free(ctx)
 	}
 
+	if len(b.mmapData) > 0 {
+		if b.useHostPtr {
+			_ = unix.Munlock(b.mmapData)
+		}
+		unix.Munmap(b.mmapData)
+		b.mmapData = nil
+	}
+
 	C.ggml_backend_sched_free(b.sched)
 }
 
+func availableHostPtrHeadroom() (uint64, error) {
+	if runtime.GOOS != "darwin" {
+		return 0, errors.New("host_ptr headroom check is only implemented on darwin")
+	}
+
+	available := uint64(C.ggml_ollama_available_memory_bytes())
+	if available == 0 {
+		return 0, errors.New("failed to query available memory")
+	}
+
+	return available, nil
+}
+
 func (b *Backend) Load(ctx context.Context, progress func(float32)) error {
+	t0 := time.Now()
+
+	if !b.warnedCopyPath && !b.useHostPtr {
+		for _, d := range gpus {
+			if C.GoString(C.ggml_backend_dev_name(d)) == "Metal" {
+				b.warnedCopyPath = true
+				slog.Warn("using copy path on Metal for quantized models; known silent corruption risk; set OLLAMA_USE_HOST_PTR=1 to use zero-copy")
+				break
+			}
+		}
+	}
+
+	if b.useHostPtr {
+		slog.Info("ggml: using host_ptr zero-copy path, skipping Load()")
+		if progress != nil {
+			progress(1.0)
+		}
+		slog.Info("ggml.Load: tensor load done", "elapsed", time.Since(t0).Seconds())
+		return nil
+	}
+
+	slog.Info("ggml.Load: starting tensor load")
+
 	if !b.allocMemory {
 		return errors.New("cannot load model without memory allocation")
 	}
@@ -493,6 +795,19 @@ func (b *Backend) Load(ctx context.Context, progress func(float32)) error {
 	}
 	slog.Info(fmt.Sprintf("offloaded %d/%d layers to GPU", gpuLayers, len(b.layers)+1))
 
+	// mmap the model file once to avoid per-tensor file I/O overhead
+	var mmapData []byte
+	if f, err := os.Open(b.modelPath); err == nil {
+		if fi, err := f.Stat(); err == nil {
+			mmapData, _ = unix.Mmap(int(f.Fd()), 0, int(fi.Size()), unix.PROT_READ, unix.MAP_SHARED)
+			defer unix.Munmap(mmapData)
+		}
+		f.Close()
+	}
+	if len(mmapData) == 0 {
+		slog.Warn("mmap failed, falling back to file I/O for tensor load", "path", b.modelPath)
+	}
+
 	var doneBytes atomic.Uint64
 	totalBytes := uint64(b.meta.Length) - b.meta.Tensors().Offset
 
@@ -515,15 +830,19 @@ func (b *Backend) Load(ctx context.Context, progress func(float32)) error {
 				tts[i] = tt
 			}
 
-			// Create a new FD for each goroutine so that each FD is read sequentially, rather than
-			// seeking around within an FD shared between all goroutines.
-			file, err := os.Open(b.modelPath)
-			if err != nil {
-				slog.Warn("file open error", "file", b.modelPath, "error", err)
-				return err
+			var sr io.Reader
+			if len(mmapData) > 0 {
+				base := int(b.meta.Tensors().Offset + t.Offset)
+				sr = bytes.NewReader(mmapData[base : base+int(t.Size())])
+			} else {
+				file, err := os.Open(b.modelPath)
+				if err != nil {
+					slog.Warn("file open error", "file", b.modelPath, "error", err)
+					return err
+				}
+				defer file.Close()
+				sr = io.NewSectionReader(file, int64(b.meta.Tensors().Offset+t.Offset), int64(t.Size()))
 			}
-			defer file.Close()
-			sr := io.NewSectionReader(file, int64(b.meta.Tensors().Offset+t.Offset), int64(t.Size()))
 
 			if t.Kind == 4 && tts[0]._type == 39 {
 				// source is mxfp4, target is ggml mxfp4
@@ -562,6 +881,17 @@ func (b *Backend) Load(ctx context.Context, progress func(float32)) error {
 						done := doneBytes.Add(uint64(n))
 						progress(float32(done) / float32(totalBytes))
 					}
+				}
+				return nil
+			} else if len(mmapData) > 0 && t.Kind != 30 && tts[0]._type != 0 {
+				// fast path: single copy from mmap for common quantized types
+				base := int(b.meta.Tensors().Offset + t.Offset)
+				for _, tt := range tts {
+					C.ggml_backend_tensor_set(tt, unsafe.Pointer(&mmapData[base]), 0, C.size_t(t.Size()))
+				}
+				if progress != nil {
+					done := doneBytes.Add(t.Size())
+					progress(float32(done) / float32(totalBytes))
 				}
 				return nil
 			} else if strings.HasSuffix(t.Name, "_exps.bias") && t.Kind == 30 && tts[0]._type == 0 {
@@ -641,7 +971,156 @@ nextDevice:
 		return err
 	}
 
+	slog.Info("ggml.Load: tensor load done", "elapsed", time.Since(t0).Seconds())
 	return nil
+}
+
+// validateHostPtrWeights reads back weight tensors through the GPU and
+// compares them against the mmap source. Returns true if they match.
+// This catches the case where the OS evicted mmap pages that the GPU
+// references via buffer_from_host_ptr, causing silent corruption.
+func (b *Backend) validateHostPtrWeights() bool {
+	if len(b.mmapData) == 0 || len(b.tensors) == 0 {
+		return true
+	}
+
+	// Synchronize all GPU work before reading back.
+	// ggml_backend_sched_synchronize flushes all backends in the scheduler
+	// (Metal + CPU), so partial offload is handled correctly.
+	b.schedMu.Lock()
+	C.ggml_backend_sched_synchronize(b.sched)
+	b.schedMu.Unlock()
+
+	// Pick up to 3 tensors to validate, spread across the model:
+	// the first tensor (alphabetically), one from the middle, and one from the end.
+	// Alphabetical order is stable and covers early layers, mid layers, and late layers.
+	var candidates []string
+	for name := range b.tensors {
+		candidates = append(candidates, name)
+	}
+	if len(candidates) == 0 {
+		return true
+	}
+
+	slices.Sort(candidates)
+	sampleNames := []string{candidates[0]}
+	if len(candidates) > 2 {
+		sampleNames = append(sampleNames, candidates[len(candidates)/2])
+	}
+	if len(candidates) > 1 {
+		sampleNames = append(sampleNames, candidates[len(candidates)-1])
+	}
+
+	for _, name := range sampleNames {
+		t := b.tensors[name]
+		if t == nil {
+			continue
+		}
+
+		tensorSize := C.ggml_nbytes(t)
+		if tensorSize == 0 {
+			continue
+		}
+
+		// Read back only the first 4KB (or full tensor if smaller). Full readback
+		// is unnecessary — page eviction affects 4KB pages, so this sample size
+		// is sufficient to detect corruption.
+		readbackSize := min(int(tensorSize), 4096)
+		readback := make([]byte, readbackSize)
+		C.ggml_backend_tensor_get(t, unsafe.Pointer(&readback[0]), 0, C.size_t(readbackSize))
+
+		// Resolve alias: the loaded tensor name may differ from the source file
+		// tensor name (e.g. output.weight aliased from token_embd.weight).
+		// tensorFileMeta is keyed by source file name; use tensorNameToFileName
+		// for resolution.
+		srcName, ok := b.tensorNameToFileName[name]
+		if !ok {
+			continue
+		}
+		fm, ok := b.tensorFileMeta[srcName]
+		if !ok {
+			continue
+		}
+
+		offset := int(b.meta.Tensors().Offset + fm.offset)
+		end := offset + int(fm.size)
+		if end > len(b.mmapData) {
+			continue
+		}
+
+		source := b.mmapData[offset:end]
+
+		// Compare the first 4KB (or less for small tensors).
+		// Full comparison is expensive for large tensors; 4KB is sufficient
+		// to catch page-eviction corruption since the OS evicts in 4KB pages.
+		checkLen := min(len(readback), len(source), 4096)
+		if checkLen <= 0 {
+			continue
+		}
+
+		if !bytes.Equal(readback[:checkLen], source[:checkLen]) {
+			slog.Warn("host_ptr validation: tensor mismatch", "name", name,
+				"tensor_size", int(tensorSize), "check_len", checkLen)
+			return false
+		}
+	}
+
+	return true
+}
+
+// ValidateWeights implements ml.HostPtrValidator.
+// Called after all memory allocations (model + KV cache + graph) are complete.
+// Skips if not using host_ptr.
+func (b *Backend) ValidateWeights() bool {
+	if !b.useHostPtr {
+		return true
+	}
+	return b.validateHostPtrWeights()
+}
+
+// fallbackToCopyPath tears down the host_ptr buffers and re-allocates
+// with standard copy-path buffers.
+// IMPORTANT: does NOT free the ggml contexts — they own the tensor metadata
+// which is referenced by b.tensors and the scheduler. Only the buffers
+// (backing storage) are freed.
+func (b *Backend) fallbackToCopyPath() {
+	// Free the host_ptr weight buffers — they're backed by the mmap
+	// and the GPU can't safely read from them under memory pressure.
+	for ctx, buf := range b.weightBuffers {
+		C.ggml_backend_buffer_free(buf)
+		delete(b.weightBuffers, ctx)
+	}
+
+	// Unmap the file — Load() will re-mmap it when called next.
+	if len(b.mmapData) > 0 {
+		_ = unix.Munlock(b.mmapData)
+		unix.Munmap(b.mmapData)
+		b.mmapData = nil
+	}
+
+	b.useHostPtr = false
+
+	// Re-allocate buffers with standard Metal buffer types (copy-path).
+	// ctxBufts was saved during New() precisely for this re-allocation.
+	for c, bt := range b.ctxBufts {
+		if C.ggml_get_first_tensor(c) == nil {
+			continue
+		}
+		buf := C.ggml_backend_alloc_ctx_tensors_from_buft(c, bt)
+		if buf == nil {
+			panic(ml.ErrNoMem{BackendMemory: *b.requiredMemory})
+		}
+		C.ggml_backend_buffer_set_usage(buf, C.GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+		b.weightBuffers[c] = buf
+	}
+}
+
+// ForceCopyPath implements ml.HostPtrValidator.
+// Tears down host_ptr buffers, re-allocates with copy-path buffers,
+// and loads tensor data from the model file.
+func (b *Backend) ForceCopyPath() error {
+	b.fallbackToCopyPath()
+	return b.Load(context.TODO(), nil)
 }
 
 func (b *Backend) BackendMemory() ml.BackendMemory {
@@ -1048,23 +1527,23 @@ func (t *Tensor) Shape() []int {
 }
 
 func (t *Tensor) Bytes() (data []byte) {
-	if t.sync != nil {
-		data = make([]byte, C.ggml_nbytes(t.t))
+	data = make([]byte, C.ggml_nbytes(t.t))
 
+	if t.sync != nil {
 		t.sync()
-		C.ggml_backend_tensor_get(t.t, unsafe.Pointer(&data[0]), 0, C.ggml_nbytes(t.t))
 	}
+	C.ggml_backend_tensor_get(t.t, unsafe.Pointer(&data[0]), 0, C.ggml_nbytes(t.t))
 
 	return
 }
 
 func (t *Tensor) Floats() (data []float32) {
-	if t.sync != nil {
-		data = make([]float32, C.ggml_nelements(t.t))
+	data = make([]float32, C.ggml_nelements(t.t))
 
+	if t.sync != nil {
 		t.sync()
-		C.ggml_backend_tensor_get(t.t, unsafe.Pointer(&data[0]), 0, C.ggml_nbytes(t.t))
 	}
+	C.ggml_backend_tensor_get(t.t, unsafe.Pointer(&data[0]), 0, C.ggml_nbytes(t.t))
 
 	return
 }

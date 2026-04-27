@@ -480,6 +480,126 @@ func testCache(t *testing.T, backend ml.Backend, cache Cache, tests []testCase) 
 	}
 }
 
+func TestPrefixSplit(t *testing.T) {
+	runPermutedVariants(t, func(t *testing.T, backend *testBackend) {
+		cache := NewCausalCache(func(ctx ml.Context, layer int, key, shift ml.Tensor) (ml.Tensor, error) { return key, nil })
+		defer cache.Close()
+
+		cache.Init(backend, ml.DTypeF16, 2, 16, 16)
+
+		// Seq 0: tokens [0-9]. Then set prefix boundary at 5.
+		context1 := backend.NewContext()
+		defer context1.Close()
+
+		// Store 10 tokens in seq 0
+		err := cache.StartForward(context1, input.Batch{
+			Positions: []int32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+			Sequences: []int{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		}, false)
+		if err != nil {
+			t.Fatalf("StartForward failed: %v", err)
+		}
+		cache.SetLayer(0)
+		tensor := context1.FromFloats([]float32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, 1, 1, 10)
+		cache.Put(context1, tensor, tensor)
+
+		// Now set prefix boundary: tokens 0-4 are immutable, 5+ are per-seq
+		cache.SetPrefixSize(0, 5)
+
+		// Copy prefix to seq 1 (only positions 0-4 shared)
+		cache.CopyPrefix(0, 1, 8)
+
+		// Seq 0 also shifts (new tokens shift old mutable cells).
+		// Remove tokens 5,6 from seq 0 (a partial removal, should succeed because mutable cells are not shared anymore).
+		err = cache.Remove(0, 5, 7)
+		if err != nil {
+			t.Fatalf("Remove mutable tail from seq0 failed: %v", err)
+		}
+
+		// Verify seq 1 still has prefix tokens 0-4 (immutable, not touched).
+		context2 := backend.NewContext()
+		defer context2.Close()
+		err = cache.StartForward(context2, input.Batch{
+			Positions: []int32{10},
+			Sequences: []int{1},
+		}, false)
+		if err != nil {
+			t.Fatalf("StartForward for seq1 failed: %v", err)
+		}
+		cache.SetLayer(0)
+		t2 := context2.FromFloats([]float32{11}, 1, 1, 1)
+		cache.Put(context2, t2, t2)
+
+		_, _, mask := cache.Get(context2)
+		maskVals := mask.Floats()
+		// mask for seq 1 should see prefix positions 0-4
+		if len(maskVals) < 5 {
+			t.Errorf("mask too short: %v", maskVals)
+		}
+	})
+}
+
+func TestPrefixSplitShift(t *testing.T) {
+	runPermutedVariants(t, func(t *testing.T, backend *testBackend) {
+		cache := NewCausalCache(func(ctx ml.Context, layer int, key, shift ml.Tensor) (ml.Tensor, error) { return key, nil })
+		defer cache.Close()
+
+		cache.Init(backend, ml.DTypeF16, 2, 16, 16)
+
+		// Seq 0: store tokens 0-9.
+		ctx1 := backend.NewContext()
+		defer ctx1.Close()
+
+		cache.SetPrefixSize(0, 3) // tokens 0-2 immutable
+
+		err := cache.StartForward(ctx1, input.Batch{
+			Positions: []int32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+			Sequences: []int{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		}, false)
+		if err != nil {
+			t.Fatalf("StartForward failed: %v", err)
+		}
+		cache.SetLayer(0)
+		tensor := ctx1.FromFloats([]float32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, 1, 1, 10)
+		cache.Put(ctx1, tensor, tensor)
+
+		// Copy prefix to seq 1.
+		cache.CopyPrefix(0, 1, 10)
+
+		// Remove tokens 3,4 from seq 0.
+		err = cache.Remove(0, 3, 5)
+		if err != nil {
+			t.Fatalf("Remove from seq0 failed: %v", err)
+		}
+
+		// Now remove tokens 5,6 from seq 1. These are mutable-only and
+		// not shared (prefix is only 0-2).
+		err = cache.Remove(1, 5, 7)
+		if err != nil {
+			t.Fatalf("Remove from seq1 failed: %v", err)
+		}
+
+		// Verify both seqs still have prefix tokens.
+		ctx2 := backend.NewContext()
+		defer ctx2.Close()
+		err = cache.StartForward(ctx2, input.Batch{
+			Positions: []int32{10},
+			Sequences: []int{0},
+		}, false)
+		if err != nil {
+			t.Fatalf("StartForward seq0 failed: %v", err)
+		}
+		cache.SetLayer(0)
+		tn := ctx2.FromFloats([]float32{11}, 1, 1, 1)
+		cache.Put(ctx2, tn, tn)
+		k, _, m := cache.Get(ctx2)
+		_ = m
+		if k.Dim(2) < 1 {
+			t.Errorf("seq 0 should have prefix+remaining tokens, got dim=%d", k.Dim(2))
+		}
+	})
+}
+
 func TestCanResume(t *testing.T) {
 	runPermutedVariants(t, func(t *testing.T, backend *testBackend) {
 		windowSize := int32(4)

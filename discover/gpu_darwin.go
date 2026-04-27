@@ -19,9 +19,25 @@ const (
 )
 
 func GetCPUMem() (memInfo, error) {
+	// On Apple Silicon, Metal uses unified memory. recommendedMaxWorkingSetSize
+	// is Metal's guidance on how much it should use. The Go scheduler should
+	// treat this as the effective GPU memory budget, not total physical RAM,
+	// to avoid overcommitting what Metal can actually allocate.
+	total := uint64(C.getPhysicalMemory())
+	recommendedVRAM := uint64(C.getRecommendedMaxVRAM())
+	if recommendedVRAM > 0 && recommendedVRAM < total {
+		total = recommendedVRAM
+	}
+
+	free := uint64(C.getFreeMemory())
+	allocatedVRAM := uint64(C.getCurrentAllocatedVRAM())
+	if allocatedVRAM > 0 && allocatedVRAM < free {
+		free -= allocatedVRAM
+	}
+
 	return memInfo{
-		TotalMemory: uint64(C.getPhysicalMemory()),
-		FreeMemory:  uint64(C.getFreeMemory()),
+		TotalMemory: total,
+		FreeMemory:  free,
 		// FreeSwap omitted as Darwin uses dynamic paging
 	}, nil
 }

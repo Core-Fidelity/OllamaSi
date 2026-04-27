@@ -1,356 +1,230 @@
-<p align="center">
-  <a href="https://ollama.com">
-    <img src="https://github.com/ollama/ollama/assets/3325447/0d0b44e2-8f4a-4e99-9b52-a5c1c741c8f7" alt="ollama" width="200"/>
-  </a>
-</p>
+# OllamaSi by Core-Fidelity
 
-# Ollama
+Apple Silicon optimizations for [Ollama](https://github.com/ollama/ollama), focused on unified-memory behavior, mlock policy, and zero-copy weight loading on macOS.
 
-Start building with open models.
+This is a fork of upstream Ollama with targeted changes to the Metal backend and model loader. The goal is to eliminate pathological memory-related regressions on Apple Silicon without breaking the experience on other platforms.
 
-## Download
+---
 
-### macOS
+## What Changed
 
-```shell
-curl -fsSL https://ollama.com/install.sh | sh
+### Unified-memory weight loading (`host_ptr` / `buffer_from_host_ptr`)
+
+On Apple Silicon, model weights can be mapped directly into GPU-visible memory via `mmap` + Metal `newBufferWithBytesNoCopy:` with `MTLResourceStorageModeShared`. This avoids the double-copy that the default Ollama path performs on Metal (one host-side copy in ggml buffers, then another GPU-side upload).
+
+OllamaSi enables this zero-copy path by default on Metal when the backend supports `buffer_from_host_ptr`.
+
+### mlock policy fix
+
+Upstream Ollama uses a percentage-based post-mlock threshold (6.5% of total physical RAM) to decide whether to keep pages pinned after `mlock()` succeeds. On 8 GB Apple Silicon systems, this threshold is hit immediately by virtually every model that successfully `mlock`s (2–4B parameter range). The resulting behavior was:
+
+1. `mlock()` succeeds.
+2. The 6.5% check immediately fails (`~524 MB` required, but far less is free after the lock).
+3. Pages are `munlock()`ed.
+4. Decode and prefill regress because the model is no longer pinned and now suffers page-fault thrashing.
+
+OllamaSi replaces this with a fixed absolute floor:
+
+```go
+const minHostPtrHeadroomBytes = 512 * 1024 * 1024 // 512 MB
 ```
 
-or [download manually](https://ollama.com/download/Ollama.dmg)
+This preserves three distinct runtime paths:
 
-### Windows
+| Path | Trigger | Behavior |
+|---|---|---|
+| **Pinned** | `mlock` succeeds + ≥ 512 MB headroom remains | Pages stay pinned. Best decode/prefill stability. |
+| **Unpinned zero-copy** | `mlock` fails with `ENOMEM` | `mmap` stays active, pages fault in lazily. Still zero-copy; load is fast. |
+| **Copy fallback** | `OLLAMA_USE_HOST_PTR=0` or structural failure | Standard Ollama copy path. Safe, slower load. |
 
-```shell
-irm https://ollama.com/install.ps1 | iex
+### Metal partial-offload `mmap` gating removed
+
+Upstream unconditionally disables `mmap` for Metal partial offload. On Apple Silicon this forces a full memory copy even when the model is slightly too large for the GPU, causing severe swap pressure on 8 GB systems. OllamaSi restores the `mmap` + partial-offload path that `llama.cpp` already supports.
+
+### Prefix KV cache (on-disk prefix persistence)
+
+Immutable prefix tokens (`num_keep`, typically system prompts) are tracked separately in the causal KV cache and never shifted or evicted. After the first full prefix computation, the KV state is serialized to `~/.ollama/kvcache/` and restored on subsequent requests, skipping recompute.
+
+Hybrid models (Qwen3-Next, etc.) store their recurrent state alongside causal KV data and produce unique cache keys so that attention and recurrent architectures never collide.
+
+---
+
+## Why This Was Needed
+
+The motivating bug was a pathological interaction between `mlock`, unified memory, and percentage-based thresholds on small-memory Apple Silicon machines. A 3–4B model like `qwen3.5:4b` would:
+
+- Load slowly due to copy-path weight duplication.
+- Decode at ~6.9 tok/s instead of ~11.9 tok/s because pinned pages were immediately released.
+- Prefill at ~47 tok/s instead of ~91 tok/s due to page-fault overhead.
+
+For large models like `gemma4:e2b` (~6.67 GB), the problem was different: instead of falling back cleanly to the unpinned zero-copy path when `mlock` failed, the old code could enter a degenerate copy-path that regressed load time by 10–20x.
+
+The fix is a single consistent memory policy: `mlock` when safe, zero-copy fallback when not, never silently degrade.
+
+---
+
+## Benchmarks
+
+All numbers cold-start, no warmup, measured with the internal benchmark harness.
+
+### `gemma4:e2b` — 6.67 GB (pathological load case)
+
+| Metric | Baseline | OllamaSi | Note |
+|---|---|---|---|
+| Load | ~13 s+ | ~1.1 s | Copy-path regression eliminated |
+| Decode | ~35–36 tok/s | ~35 tok/s | No regression; zero-copy preserved |
+| TTFT | Severe | ~1.2–1.3 s | First-token latency recovered |
+
+The 13-second baseline was caused by full weight duplication through the copy path when zero-copy should have been active. OllamaSi restores the fast path.
+
+### `qwen3.5:4b` — recovery from always-unlock bug
+
+| Metric | Baseline | OllamaSi | Delta |
+|---|---|---|---|
+| Load | 2,886 ms | 1,460 ms | –49 % |
+| TTFT | 4,171 ms | 2,003 ms | –52 % |
+| Prefill | 47.2 tok/s | 91.7 tok/s | +94 % |
+| Decode | 6.9 tok/s | 11.9 tok/s | +72 % |
+
+This is the clearest demonstration of the old mlock unlock-after-success pathology.
+
+### Models observed with correct behavior under the 512 MB policy
+
+Pinned correctly (small-to-medium models on 8 GB):
+
+- `phi3-mini`
+- `qwen3.5:2b`
+- `medgemma1.5:4b`
+- `translategemma:4b`
+- `qwen3.5:4b`
+
+Unpinned correctly via `ENOMEM` fallback (large models):
+
+- `gemma4:e2b`
+
+No model-specific gates or heuristics are used. The same policy applies to every model.
+
+---
+
+## Technical Explanation
+
+### The memory model on Apple Silicon
+
+Apple Silicon uses unified memory: the CPU and GPU share the same physical DRAM. Metal can create GPU-visible buffers directly from host `mmap` pages without a copy, via `newBufferWithBytesNoCopy:` with `MTLResourceStorageModeShared`. This means:
+
+- **Zero-copy path**: `mmap` the model file once → Metal buffer wraps those pages → CPU layers read directly from the same pages.
+- **Copy path**: `mmap` the file → allocate ggml buffers → copy tensor data into those buffers → upload to GPU buffers. This creates 2–3x memory pressure depending on overlap.
+
+### The old mlock threshold
+
+`mlock` pins pages in RAM, preventing the OS from reclaiming them. On memory-constrained systems, paging out model weights during inference causes the GPU to fault them back in from disk, destroying throughput. So pinning is valuable.
+
+The old policy was:
+
+```go
+if availableAfterMlock < totalPhysicalMemory * 0.065 { munlock() }
 ```
 
-or [download manually](https://ollama.com/download/OllamaSetup.exe)
+On an 8 GB Mac, `0.065 * 8 GB = ~524 MB`. After a successful `mlock` of a 3–4 GB model, free memory is almost always below that threshold, so `munlock()` fires immediately. The model pays the `mlock` cost and receives none of the benefit.
 
-### Linux
+### The fixed policy
 
-```shell
-curl -fsSL https://ollama.com/install.sh | sh
+```go
+const minHostPtrHeadroomBytes = 512 * 1024 * 1024
 ```
 
-[Manual install instructions](https://docs.ollama.com/linux#manual-install)
+Post-mlock, we query actual available bytes (free + speculative + inactive on macOS). If ≥ 512 MB remains, we keep the lock. If < 512 MB, we `munlock()` immediately.
 
-### Docker
+This threshold was chosen empirically: it is large enough to prevent thrashing on 8 GB systems with working-set pressure from inference, and small enough not to block models that genuinely fit. A percentage would vary wildly across machines (512 MB is 6.4% of 8 GB but only 1.6% of 32 GB) and would break the same way on every small-memory machine. An absolute floor is the right invariant.
 
-The official [Ollama Docker image](https://hub.docker.com/r/ollama/ollama) `ollama/ollama` is available on Docker Hub.
+### Partial offload and mmap
 
-### Libraries
+When a model exceeds GPU layer capacity, Ollama offloads some layers to the CPU. The old code disabled `mmap` on Metal for any partial offload, forcing a full copy of weights into CPU ggml buffers in addition to the GPU copy. On an 8 GB machine with a 4–5 GB model, this pushes the working set into swap.
 
-- [ollama-python](https://github.com/ollama/ollama-python)
-- [ollama-js](https://github.com/ollama/ollama-js)
+The fix removes the Metal-specific disable. `llama.cpp` already supports partial offload with `mmap` on Metal via the same `buffer_from_host_ptr` mechanism. Load times stay fast and swap pressure stays low.
 
-### Community
+### Prefix KV caching
 
-- [Discord](https://discord.gg/ollama)
-- [𝕏 (Twitter)](https://x.com/ollama)
-- [Reddit](https://reddit.com/r/ollama)
+The prefix cache saves K/V tensor rows for `num_keep` positions after the first forward pass. On subsequent loads, it restores those rows directly, skipping prompt recompute.
 
-## Get started
+A headroom gate prevents restore when available RAM is below 300 MB. This is a safety valve: hydrating a large prefix cache under memory pressure would do more harm than good. The gate uses the same absolute-floor logic as the `mlock` policy for consistency.
 
-```
-ollama
-```
+---
 
-You'll be prompted to run a model or connect Ollama to your existing agents or applications such as `Claude Code`, `OpenClaw`, `OpenCode` , `Codex`, `Copilot`,  and more.
+## Design Decisions
 
-### Coding
+| Decision | Rationale |
+|---|---|
+| **Absolute headroom floor, not percentage** | Percentage thresholds fail on small-memory machines (8 GB) and are unnecessarily permissive on large ones (32 GB). A fixed floor is the only policy that behaves consistently across the Apple Silicon line. |
+| **No model-size gates** | `gemma4:e2b` is not special. The same memory policy should apply to every model. If a model mlocks safely, it gets pinning. If not, it gets zero-copy fallback. |
+| **No runtime knob for threshold** | The 512 MB value was chosen from observed system behavior on 8 GB Macs. Making it configurable would invite users to break the invariant without understanding the failure mode. |
+| `OLLAMA_USE_HOST_PTR=0` still works | Explicit opt-out is preserved for debugging or for environments where zero-copy is known to misbehave. |
+| **Validation gate after full allocation** | `ValidateWeights()` fires after `allocModel()` (KV cache + graph memory) but before the first inference request. This is the peak memory-pressure point; a validation failure here means inference would have corrupted silently. |
+| **Prefix cache stored per key hash** | The cache key is `SHA256(modelPath, archParams, prefixTokens)`. `IsRecurrent` is part of `archParams` so hybrid and pure-attention models never share entries. |
 
-To launch a specific integration:
+---
 
-```
-ollama launch claude
-```
+## Relationship to Upstream Ollama
 
-Supported integrations include [Claude Code](https://docs.ollama.com/integrations/claude-code), [Codex](https://docs.ollama.com/integrations/codex), [Copilot CLI](https://docs.ollama.com/integrations/copilot-cli), [Droid](https://docs.ollama.com/integrations/droid), and [OpenCode](https://docs.ollama.com/integrations/opencode).
+OllamaSi is a fork of [ollama/ollama](https://github.com/ollama/ollama) with a narrow scope: Apple Silicon memory-policy correctness and runtime performance.
 
-### AI assistant
+- Upstream Ollama is an excellent project. This fork does not claim to replace it.
+- The changes here are intended as reference implementations for upstream consideration.
+- No new model architectures or inference kernels are introduced.
+- The CLI, REST API, model library, and Python/JS bindings remain unchanged.
 
-Use [OpenClaw](https://docs.ollama.com/integrations/openclaw) to turn Ollama into a personal AI assistant across WhatsApp, Telegram, Slack, Discord, and more:
+Where upstream behavior is correct, OllamaSi does not touch it.
 
-```
-ollama launch openclaw
-```
+---
 
-### Chat with a model
+## Build and Install
 
-Run and chat with [Gemma 3](https://ollama.com/library/gemma3):
+Requires macOS with Xcode command-line tools.
 
-```
-ollama run gemma3
-```
-
-See [ollama.com/library](https://ollama.com/library) for the full list.
-
-See the [quickstart guide](https://docs.ollama.com/quickstart) for more details.
-
-## REST API
-
-Ollama has a REST API for running and managing models.
-
-```
-curl http://localhost:11434/api/chat -d '{
-  "model": "gemma3",
-  "messages": [{
-    "role": "user",
-    "content": "Why is the sky blue?"
-  }],
-  "stream": false
-}'
+```bash
+git clone https://github.com/OllamaSi/ollama
+cd ollama
+go generate ./...
+go build .
 ```
 
-See the [API documentation](https://docs.ollama.com/api) for all endpoints.
+To run the server:
 
-### Python
-
-```
-pip install ollama
+```bash
+./ollama serve
 ```
 
-```python
-from ollama import chat
+To run a model:
 
-response = chat(model='gemma3', messages=[
-  {
-    'role': 'user',
-    'content': 'Why is the sky blue?',
-  },
-])
-print(response.message.content)
+```bash
+ollama run qwen3.5:4b
 ```
 
-### JavaScript
+All standard Ollama commands and environment variables work unchanged.
 
-```
-npm i ollama
-```
+### Environment variables
 
-```javascript
-import ollama from "ollama";
+| Variable | Effect |
+|---|---|
+| `OLLAMA_USE_HOST_PTR=0` | Force standard copy-path weight loading (disables zero-copy). |
+| `OLLAMA_USE_HOST_PTR=1` | Force zero-copy even if the backend would normally disable it. |
 
-const response = await ollama.chat({
-  model: "gemma3",
-  messages: [{ role: "user", content: "Why is the sky blue?" }],
-});
-console.log(response.message.content);
-```
+---
 
-## Supported backends
+## Support
 
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) project founded by Georgi Gerganov.
+If this fork saves you time, compute, frustration or stress, please consider supporting my future endeavours!
 
-## Documentation
+- [Buy me a coffee](https://buymeacoffee.com/corefidelity)
+- [GitHub Sponsors](https://github.com/sponsors/Core-Fidelity)
 
-- [CLI reference](https://docs.ollama.com/cli)
-- [REST API reference](https://docs.ollama.com/api)
-- [Importing models](https://docs.ollama.com/import)
-- [Modelfile reference](https://docs.ollama.com/modelfile)
-- [Building from source](https://github.com/ollama/ollama/blob/main/docs/development.md)
+Thanks for reading this far down!
 
-## Community Integrations
+---
 
-> Want to add your project? Open a pull request.
+## License
 
-### Chat Interfaces
+OllamaSi is released under the same license as upstream Ollama: [MIT](LICENSE).
 
-#### Web
+Upstream Ollama is copyright © Ollama, Inc. This fork retains all upstream attribution and license headers.
 
-- [Open WebUI](https://github.com/open-webui/open-webui) - Extensible, self-hosted AI interface
-- [Onyx](https://github.com/onyx-dot-app/onyx) - Connected AI workspace
-- [LibreChat](https://github.com/danny-avila/LibreChat) - Enhanced ChatGPT clone with multi-provider support
-- [Lobe Chat](https://github.com/lobehub/lobe-chat) - Modern chat framework with plugin ecosystem ([docs](https://lobehub.com/docs/self-hosting/examples/ollama))
-- [NextChat](https://github.com/ChatGPTNextWeb/ChatGPT-Next-Web) - Cross-platform ChatGPT UI ([docs](https://docs.nextchat.dev/models/ollama))
-- [Perplexica](https://github.com/ItzCrazyKns/Perplexica) - AI-powered search engine, open-source Perplexity alternative
-- [big-AGI](https://github.com/enricoros/big-AGI) - AI suite for professionals
-- [Lollms WebUI](https://github.com/ParisNeo/lollms-webui) - Multi-model web interface
-- [ChatOllama](https://github.com/sugarforever/chat-ollama) - Chatbot with knowledge bases
-- [Bionic GPT](https://github.com/bionic-gpt/bionic-gpt) - On-premise AI platform
-- [Chatbot UI](https://github.com/ivanfioravanti/chatbot-ollama) - ChatGPT-style web interface
-- [Hollama](https://github.com/fmaclen/hollama) - Minimal web interface
-- [Chatbox](https://github.com/Bin-Huang/Chatbox) - Desktop and web AI client
-- [chat](https://github.com/swuecho/chat) - Chat web app for teams
-- [Ollama RAG Chatbot](https://github.com/datvodinh/rag-chatbot.git) - Chat with multiple PDFs using RAG
-- [Tkinter-based client](https://github.com/chyok/ollama-gui) - Python desktop client
-
-#### Desktop
-
-- [Dify.AI](https://github.com/langgenius/dify) - LLM app development platform
-- [AnythingLLM](https://github.com/Mintplex-Labs/anything-llm) - All-in-one AI app for Mac, Windows, and Linux
-- [Maid](https://github.com/Mobile-Artificial-Intelligence/maid) - Cross-platform mobile and desktop client
-- [Witsy](https://github.com/nbonamy/witsy) - AI desktop app for Mac, Windows, and Linux
-- [Cherry Studio](https://github.com/kangfenmao/cherry-studio) - Multi-provider desktop client
-- [Ollama App](https://github.com/JHubi1/ollama-app) - Multi-platform client for desktop and mobile
-- [PyGPT](https://github.com/szczyglis-dev/py-gpt) - AI desktop assistant for Linux, Windows, and Mac
-- [Alpaca](https://github.com/Jeffser/Alpaca) - GTK4 client for Linux and macOS
-- [SwiftChat](https://github.com/aws-samples/swift-chat) - Cross-platform including iOS, Android, and Apple Vision Pro
-- [Enchanted](https://github.com/AugustDev/enchanted) - Native macOS and iOS client
-- [RWKV-Runner](https://github.com/josStorer/RWKV-Runner) - Multi-model desktop runner
-- [Ollama Grid Search](https://github.com/dezoito/ollama-grid-search) - Evaluate and compare models
-- [macai](https://github.com/Renset/macai) - macOS client for Ollama and ChatGPT
-- [AI Studio](https://github.com/MindWorkAI/AI-Studio) - Multi-provider desktop IDE
-- [Reins](https://github.com/ibrahimcetin/reins) - Parameter tuning and reasoning model support
-- [ConfiChat](https://github.com/1runeberg/confichat) - Privacy-focused with optional encryption
-- [LLocal.in](https://github.com/kartikm7/llocal) - Electron desktop client
-- [MindMac](https://mindmac.app) - AI chat client for Mac
-- [Msty](https://msty.app) - Multi-model desktop client
-- [BoltAI for Mac](https://boltai.com) - AI chat client for Mac
-- [IntelliBar](https://intellibar.app/) - AI-powered assistant for macOS
-- [Kerlig AI](https://www.kerlig.com/) - AI writing assistant for macOS
-- [Hillnote](https://hillnote.com) - Markdown-first AI workspace
-- [Perfect Memory AI](https://www.perfectmemory.ai/) - Productivity AI personalized by screen and meeting history
-
-#### Mobile
-
-- [Ollama Android Chat](https://github.com/sunshine0523/OllamaServer) - One-click Ollama on Android
-
-> SwiftChat, Enchanted, Maid, Ollama App, Reins, and ConfiChat listed above also support mobile platforms.
-
-### Code Editors & Development
-
-- [Cline](https://github.com/cline/cline) - VS Code extension for multi-file/whole-repo coding
-- [Continue](https://github.com/continuedev/continue) - Open-source AI code assistant for any IDE
-- [Void](https://github.com/voideditor/void) - Open source AI code editor, Cursor alternative
-- [Copilot for Obsidian](https://github.com/logancyang/obsidian-copilot) - AI assistant for Obsidian
-- [twinny](https://github.com/rjmacarthy/twinny) - Copilot and Copilot chat alternative
-- [gptel Emacs client](https://github.com/karthink/gptel) - LLM client for Emacs
-- [Ollama Copilot](https://github.com/bernardo-bruning/ollama-copilot) - Use Ollama as GitHub Copilot
-- [Obsidian Local GPT](https://github.com/pfrankov/obsidian-local-gpt) - Local AI for Obsidian
-- [Ellama Emacs client](https://github.com/s-kostyaev/ellama) - LLM tool for Emacs
-- [orbiton](https://github.com/xyproto/orbiton) - Config-free text editor with Ollama tab completion
-- [AI ST Completion](https://github.com/yaroslavyaroslav/OpenAI-sublime-text) - Sublime Text 4 AI assistant
-- [VT Code](https://github.com/vinhnx/vtcode) - Rust-based terminal coding agent with Tree-sitter
-- [QodeAssist](https://github.com/Palm1r/QodeAssist) - AI coding assistant for Qt Creator
-- [AI Toolkit for VS Code](https://aka.ms/ai-tooklit/ollama-docs) - Microsoft-official VS Code extension
-- [Open Interpreter](https://docs.openinterpreter.com/language-model-setup/local-models/ollama) - Natural language interface for computers
-
-### Libraries & SDKs
-
-- [LiteLLM](https://github.com/BerriAI/litellm) - Unified API for 100+ LLM providers
-- [Semantic Kernel](https://github.com/microsoft/semantic-kernel/tree/main/python/semantic_kernel/connectors/ai/ollama) - Microsoft AI orchestration SDK
-- [LangChain4j](https://github.com/langchain4j/langchain4j) - Java LangChain ([example](https://github.com/langchain4j/langchain4j-examples/tree/main/ollama-examples/src/main/java))
-- [LangChainGo](https://github.com/tmc/langchaingo/) - Go LangChain ([example](https://github.com/tmc/langchaingo/tree/main/examples/ollama-completion-example))
-- [Spring AI](https://github.com/spring-projects/spring-ai) - Spring framework AI support ([docs](https://docs.spring.io/spring-ai/reference/api/chat/ollama-chat.html))
-- [LangChain](https://python.langchain.com/docs/integrations/chat/ollama/) and [LangChain.js](https://js.langchain.com/docs/integrations/chat/ollama/) with [example](https://js.langchain.com/docs/tutorials/local_rag/)
-- [Ollama for Ruby](https://github.com/crmne/ruby_llm) - Ruby LLM library
-- [any-llm](https://github.com/mozilla-ai/any-llm) - Unified LLM interface by Mozilla
-- [OllamaSharp for .NET](https://github.com/awaescher/OllamaSharp) - .NET SDK
-- [LangChainRust](https://github.com/Abraxas-365/langchain-rust) - Rust LangChain ([example](https://github.com/Abraxas-365/langchain-rust/blob/main/examples/llm_ollama.rs))
-- [Agents-Flex for Java](https://github.com/agents-flex/agents-flex) - Java agent framework ([example](https://github.com/agents-flex/agents-flex/tree/main/agents-flex-llm/agents-flex-llm-ollama/src/test/java/com/agentsflex/llm/ollama))
-- [Elixir LangChain](https://github.com/brainlid/langchain) - Elixir LangChain
-- [Ollama-rs for Rust](https://github.com/pepperoni21/ollama-rs) - Rust SDK
-- [LangChain for .NET](https://github.com/tryAGI/LangChain) - .NET LangChain ([example](https://github.com/tryAGI/LangChain/blob/main/examples/LangChain.Samples.OpenAI/Program.cs))
-- [chromem-go](https://github.com/philippgille/chromem-go) - Go vector database with Ollama embeddings ([example](https://github.com/philippgille/chromem-go/tree/v0.5.0/examples/rag-wikipedia-ollama))
-- [LangChainDart](https://github.com/davidmigloz/langchain_dart) - Dart LangChain
-- [LlmTornado](https://github.com/lofcz/llmtornado) - Unified C# interface for multiple inference APIs
-- [Ollama4j for Java](https://github.com/ollama4j/ollama4j) - Java SDK
-- [Ollama for Laravel](https://github.com/cloudstudio/ollama-laravel) - Laravel integration
-- [Ollama for Swift](https://github.com/mattt/ollama-swift) - Swift SDK
-- [LlamaIndex](https://docs.llamaindex.ai/en/stable/examples/llm/ollama/) and [LlamaIndexTS](https://ts.llamaindex.ai/modules/llms/available_llms/ollama) - Data framework for LLM apps
-- [Haystack](https://github.com/deepset-ai/haystack-integrations/blob/main/integrations/ollama.md) - AI pipeline framework
-- [Firebase Genkit](https://firebase.google.com/docs/genkit/plugins/ollama) - Google AI framework
-- [Ollama-hpp for C++](https://github.com/jmont-dev/ollama-hpp) - C++ SDK
-- [PromptingTools.jl](https://github.com/svilupp/PromptingTools.jl) - Julia LLM toolkit ([example](https://svilupp.github.io/PromptingTools.jl/dev/examples/working_with_ollama))
-- [Ollama for R - rollama](https://github.com/JBGruber/rollama) - R SDK
-- [Portkey](https://portkey.ai/docs/welcome/integration-guides/ollama) - AI gateway
-- [Testcontainers](https://testcontainers.com/modules/ollama/) - Container-based testing
-- [LLPhant](https://github.com/theodo-group/LLPhant?tab=readme-ov-file#ollama) - PHP AI framework
-
-### Frameworks & Agents
-
-- [AutoGPT](https://github.com/Significant-Gravitas/AutoGPT/blob/master/docs/content/platform/ollama.md) - Autonomous AI agent platform
-- [crewAI](https://github.com/crewAIInc/crewAI) - Multi-agent orchestration framework
-- [Strands Agents](https://github.com/strands-agents/sdk-python) - Model-driven agent building by AWS
-- [Cheshire Cat](https://github.com/cheshire-cat-ai/core) - AI assistant framework
-- [any-agent](https://github.com/mozilla-ai/any-agent) - Unified agent framework interface by Mozilla
-- [Stakpak](https://github.com/stakpak/agent) - Open source DevOps agent
-- [Hexabot](https://github.com/hexastack/hexabot) - Conversational AI builder
-- [Neuro SAN](https://github.com/cognizant-ai-lab/neuro-san-studio) - Multi-agent orchestration ([docs](https://github.com/cognizant-ai-lab/neuro-san-studio/blob/main/docs/user_guide.md#ollama))
-
-### RAG & Knowledge Bases
-
-- [RAGFlow](https://github.com/infiniflow/ragflow) - RAG engine based on deep document understanding
-- [R2R](https://github.com/SciPhi-AI/R2R) - Open-source RAG engine
-- [MaxKB](https://github.com/1Panel-dev/MaxKB/) - Ready-to-use RAG chatbot
-- [Minima](https://github.com/dmayboroda/minima) - On-premises or fully local RAG
-- [Chipper](https://github.com/TilmanGriesel/chipper) - AI interface with Haystack RAG
-- [ARGO](https://github.com/xark-argo/argo) - RAG and deep research on Mac/Windows/Linux
-- [Archyve](https://github.com/nickthecook/archyve) - RAG-enabling document library
-- [Casibase](https://casibase.org) - AI knowledge base with RAG and SSO
-- [BrainSoup](https://www.nurgo-software.com/products/brainsoup) - Native client with RAG and multi-agent automation
-
-### Bots & Messaging
-
-- [LangBot](https://github.com/RockChinQ/LangBot) - Multi-platform messaging bots with agents and RAG
-- [AstrBot](https://github.com/Soulter/AstrBot/) - Multi-platform chatbot with RAG and plugins
-- [Discord-Ollama Chat Bot](https://github.com/kevinthedang/discord-ollama) - TypeScript Discord bot
-- [Ollama Telegram Bot](https://github.com/ruecat/ollama-telegram) - Telegram bot
-- [LLM Telegram Bot](https://github.com/innightwolfsleep/llm_telegram_bot) - Telegram bot for roleplay
-
-### Terminal & CLI
-
-- [aichat](https://github.com/sigoden/aichat) - All-in-one LLM CLI with Shell Assistant, RAG, and AI tools
-- [oterm](https://github.com/ggozad/oterm) - Terminal client for Ollama
-- [gollama](https://github.com/sammcj/gollama) - Go-based model manager for Ollama
-- [tlm](https://github.com/yusufcanb/tlm) - Local shell copilot
-- [tenere](https://github.com/pythops/tenere) - TUI for LLMs
-- [ParLlama](https://github.com/paulrobello/parllama) - TUI for Ollama
-- [llm-ollama](https://github.com/taketwo/llm-ollama) - Plugin for [Datasette's LLM CLI](https://llm.datasette.io/en/stable/)
-- [ShellOracle](https://github.com/djcopley/ShellOracle) - Shell command suggestions
-- [LLM-X](https://github.com/mrdjohnson/llm-x) - Progressive web app for LLMs
-- [cmdh](https://github.com/pgibler/cmdh) - Natural language to shell commands
-- [VT](https://github.com/vinhnx/vt.ai) - Minimal multimodal AI chat app
-
-### Productivity & Apps
-
-- [AppFlowy](https://github.com/AppFlowy-IO/AppFlowy) - AI collaborative workspace, self-hostable Notion alternative
-- [Screenpipe](https://github.com/mediar-ai/screenpipe) - 24/7 screen and mic recording with AI-powered search
-- [Vibe](https://github.com/thewh1teagle/vibe) - Transcribe and analyze meetings
-- [Page Assist](https://github.com/n4ze3m/page-assist) - Chrome extension for AI-powered browsing
-- [NativeMind](https://github.com/NativeMindBrowser/NativeMindExtension) - Private, on-device browser AI assistant
-- [Ollama Fortress](https://github.com/ParisNeo/ollama_proxy_server) - Security proxy for Ollama
-- [1Panel](https://github.com/1Panel-dev/1Panel/) - Web-based Linux server management
-- [Writeopia](https://github.com/Writeopia/Writeopia) - Text editor with Ollama integration
-- [QA-Pilot](https://github.com/reid41/QA-Pilot) - GitHub code repository understanding
-- [Raycast extension](https://github.com/MassimilianoPasquini97/raycast_ollama) - Ollama in Raycast
-- [Painting Droid](https://github.com/mateuszmigas/painting-droid) - Painting app with AI integrations
-- [Serene Pub](https://github.com/doolijb/serene-pub) - AI roleplaying app
-- [Mayan EDMS](https://gitlab.com/mayan-edms/mayan-edms) - Document management with Ollama workflows
-- [TagSpaces](https://www.tagspaces.org) - File management with [AI tagging](https://docs.tagspaces.org/ai/)
-
-### Observability & Monitoring
-
-- [Opik](https://www.comet.com/docs/opik/cookbook/ollama) - Debug, evaluate, and monitor LLM applications
-- [OpenLIT](https://github.com/openlit/openlit) - OpenTelemetry-native monitoring for Ollama and GPUs
-- [Lunary](https://lunary.ai/docs/integrations/ollama) - LLM observability with analytics and PII masking
-- [Langfuse](https://langfuse.com/docs/integrations/ollama) - Open source LLM observability
-- [HoneyHive](https://docs.honeyhive.ai/integrations/ollama) - AI observability and evaluation for agents
-- [MLflow Tracing](https://mlflow.org/docs/latest/llms/tracing/index.html#automatic-tracing) - Open source LLM observability
-
-### Database & Embeddings
-
-- [pgai](https://github.com/timescale/pgai) - PostgreSQL as a vector database ([guide](https://github.com/timescale/pgai/blob/main/docs/vectorizer-quick-start.md))
-- [MindsDB](https://github.com/mindsdb/mindsdb/blob/staging/mindsdb/integrations/handlers/ollama_handler/README.md) - Connect Ollama with 200+ data platforms
-- [chromem-go](https://github.com/philippgille/chromem-go/blob/v0.5.0/embed_ollama.go) - Embeddable vector database for Go ([example](https://github.com/philippgille/chromem-go/tree/v0.5.0/examples/rag-wikipedia-ollama))
-- [Kangaroo](https://github.com/dbkangaroo/kangaroo) - AI-powered SQL client
-
-### Infrastructure & Deployment
-
-#### Cloud
-
-- [Google Cloud](https://cloud.google.com/run/docs/tutorials/gpu-gemma2-with-ollama)
-- [Fly.io](https://fly.io/docs/python/do-more/add-ollama/)
-- [Koyeb](https://www.koyeb.com/deploy/ollama)
-- [Harbor](https://github.com/av/harbor) - Containerized LLM toolkit with Ollama as default backend
-
-#### Package Managers
-
-- [Pacman](https://archlinux.org/packages/extra/x86_64/ollama/)
-- [Homebrew](https://formulae.brew.sh/formula/ollama)
-- [Nix package](https://search.nixos.org/packages?show=ollama&from=0&size=50&sort=relevance&type=packages&query=ollama)
-- [Helm Chart](https://artifacthub.io/packages/helm/ollama-helm/ollama)
-- [Gentoo](https://github.com/gentoo/guru/tree/master/app-misc/ollama)
-- [Flox](https://flox.dev/blog/ollama-part-one)
-- [Guix channel](https://codeberg.org/tusharhero/ollama-guix)

@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime"
@@ -28,6 +29,7 @@ import (
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/envconfig"
+	"github.com/ollama/ollama/fs"
 	"github.com/ollama/ollama/fs/ggml"
 	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/logutil"
@@ -379,12 +381,71 @@ type Server struct {
 	// KV cache
 	cache *InputCache
 
+	// file-backed prefix KV cache metadata
+	prefixCache *PrefixCache
+	archParams  ArchParams
+
 	// next sequence for prompt processing to avoid starvation
 	nextSeq int
 
 	// multimodalHash generates hashes for comparing equality
 	// of non-text data
 	multimodalHash maphash.Hash
+}
+
+func archParamsFromConfig(cfg fs.Config, dtype ml.DType) ArchParams {
+	numKVHeads := int(cfg.Uint("attention.head_count_kv", 0))
+	numLayers := int(cfg.Uint("block_count", 0))
+
+	// Detect hybrid models: per-layer KV head counts where zero = recurrent layer.
+	var isRecurrent []bool
+	headCountKV := cfg.Ints("attention.head_count_kv")
+	if len(headCountKV) > 0 {
+		isRecurrent = make([]bool, numLayers)
+		for i := range headCountKV {
+			if i < numLayers && headCountKV[i] == 0 {
+				isRecurrent[i] = true
+			}
+		}
+		// If all layers are attention, don't set isRecurrent (V1 compatible).
+		allAttention := true
+		for _, r := range isRecurrent {
+			if r {
+				allAttention = false
+				break
+			}
+		}
+		if allAttention {
+			isRecurrent = nil
+		}
+	}
+
+	// For hybrid models, numKVHeads is the max KV heads (used for attention layer key hash).
+	if numKVHeads == 0 {
+		for _, v := range headCountKV {
+			numKVHeads = max(numKVHeads, int(v))
+		}
+	}
+
+	headDim := int(cfg.Uint("attention.key_length", 0))
+	if headDim == 0 {
+		headDim = int(cfg.Uint("attention.value_length", 0))
+	}
+	if headDim == 0 {
+		numHeads := int(cfg.Uint("attention.head_count", 0))
+		if numHeads > 0 {
+			headDim = int(cfg.Uint("embedding_length", 0)) / numHeads
+		}
+	}
+
+	return ArchParams{
+		NumLayers:   numLayers,
+		NumKVHeads:  numKVHeads,
+		HeadDim:     headDim,
+		DType:       int(dtype),
+		RopeFreq:    cfg.Float("rope.freq_base", 0),
+		IsRecurrent: isRecurrent,
+	}
 }
 
 func (s *Server) allNil() bool {
@@ -556,19 +617,8 @@ func (s *Server) forwardBatch(pendingBatch batchState) (nextBatch batchState, er
 					break
 				}
 
-				err = s.cache.ShiftCacheSlot(seq.cache, seq.numKeep)
-				if err != nil {
-					var reprocess *ErrReprocessInputs
-					if errors.As(err, &reprocess) {
-						// Prepend these inputs to the sequence's inputs queue for reprocessing
-						seq.inputs = append(reprocess.Inputs, seq.inputs...)
-						// Skip this sequence but continue processing the rest
-						nextBatch.seqs[seqIdx] = nil // clear this sequence for this batch
-						err = nil
-						continue
-					} else {
-						return
-					}
+				if err = s.cache.ShiftCacheSlot(seq.cache, seq.numKeep); err != nil {
+					return
 				}
 			}
 
@@ -728,6 +778,41 @@ func (s *Server) computeBatch(activeBatch batchState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	for _, seq := range activeBatch.seqs {
+		if seq == nil || seq.cache == nil || seq.cache.SavePrefixSize <= 0 || s.prefixCache == nil || s.cache == nil || s.cache.cache == nil {
+			continue
+		}
+		if int32(len(seq.cache.Inputs)) < seq.cache.SavePrefixSize {
+			continue
+		}
+
+		size := seq.cache.SavePrefixSize
+		seq.cache.SavePrefixSize = 0
+
+		keys, vals, err := s.cache.cache.SavePrefixData(seq.cache.Id, size)
+		if err != nil {
+			slog.Warn("prefix cache save failed", "err", err)
+			continue
+		}
+
+		empty := true
+		for _, k := range keys {
+			if len(k) > 0 {
+				empty = false
+				break
+			}
+		}
+		if empty {
+			slog.Warn("prefix cache save skipped: empty key data")
+			continue
+		}
+
+		key := s.prefixCache.Key(s.modelPath, s.archParams, prefixInputTokens(seq.cache.Inputs[:int(size)]), size)
+		if err := s.prefixCache.Save(key, keys, vals, size, s.archParams); err == nil {
+			_ = s.prefixCache.Evict()
+		}
+	}
+
 	logutil.Trace("computeBatch: decoding", "batchID", activeBatch.id)
 	for i, seq := range s.seqs {
 		if seq == nil || nextBatchTokens[i] == nil {
@@ -744,6 +829,7 @@ func (s *Server) computeBatch(activeBatch batchState) {
 		if seq.numPredicted == 1 {
 			seq.processingDuration = seq.lastUpdatedAt.Sub(seq.startedAt)
 			seq.startedAt = seq.lastUpdatedAt
+			slog.Info("INSTRUMENT FIRST_TOKEN_EMIT", "seq", i, "processingDuration", seq.processingDuration.Seconds())
 		}
 
 		// if done processing the prompt, generate an embedding and return
@@ -930,7 +1016,7 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 	found := false
 	for i, sq := range s.seqs {
 		if sq == nil {
-			seq.cache, seq.inputs, err = s.cache.LoadCacheSlot(seq.inputs, true)
+			seq.cache, seq.inputs, err = s.cache.LoadCacheSlot(seq.inputs, true, seq.numKeep)
 			if err != nil {
 				s.mu.Unlock()
 				s.seqsSem.Release(1)
@@ -1026,7 +1112,7 @@ func (s *Server) embeddings(w http.ResponseWriter, r *http.Request) {
 	found := false
 	for i, sq := range s.seqs {
 		if sq == nil {
-			seq.cache, seq.inputs, err = s.cache.LoadCacheSlot(seq.inputs, false)
+			seq.cache, seq.inputs, err = s.cache.LoadCacheSlot(seq.inputs, false, seq.numKeep)
 			if err != nil {
 				s.mu.Unlock()
 				s.seqsSem.Release(1)
@@ -1220,7 +1306,17 @@ func (s *Server) allocModel(
 		}
 	}
 
-	s.cache, err = NewInputCache(s.model, kvCacheType, int32(kvSize), parallel, s.batchSize, multiUserCache)
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	s.prefixCache, err = NewPrefixCache(filepath.Join(homeDir, ".ollama", "kvcache"), 4<<30)
+	if err != nil {
+		return err
+	}
+	s.archParams = archParamsFromConfig(s.model.Backend().Config(), kvCacheTypeFromStr(kvCacheType))
+
+	s.cache, err = NewInputCache(s.model, kvCacheType, int32(kvSize), parallel, s.batchSize, multiUserCache, s.modelPath, s.archParams, s.prefixCache)
 	if err != nil {
 		return err
 	}
@@ -1241,6 +1337,7 @@ func (s *Server) allocModel(
 func (s *Server) closeModel() {
 	s.cache.Close()
 	s.cache = nil
+	s.prefixCache = nil
 	if s.model != nil {
 		s.model.Backend().Close()
 		s.model = nil
@@ -1250,6 +1347,8 @@ func (s *Server) closeModel() {
 // loadModel loads the weights for a model. The memory must already
 // have been allocated with allocModel
 func (s *Server) loadModel() {
+	slog.Info("INSTRUMENT loadModel: starting weight load")
+	t0 := time.Now()
 	err := s.model.Backend().Load(context.TODO(),
 		func(progress float32) {
 			s.progress = progress
@@ -1257,10 +1356,32 @@ func (s *Server) loadModel() {
 	if err != nil {
 		panic(fmt.Errorf("failed to load model: %v", err))
 	}
+	slog.Info("INSTRUMENT loadModel: weight load done", "elapsed", time.Since(t0).Seconds())
 
 	if postLoader, ok := s.model.(model.PostLoader); ok {
 		if err := postLoader.PostLoad(); err != nil {
 			panic(fmt.Errorf("failed to finalize model initialization: %v", err))
+		}
+	}
+
+	// Validate zero-copy weights under peak-memory conditions.
+	//
+	// allocModel reserves KV cache + graph memory before loadModel runs,
+	// so by this point the system is under the same page-pressure the GPU
+	// will face during inference. Firing ValidateWeights here catches
+	// the OS-eviction scenario that causes silent GPU read-back corruption
+	// on Apple Silicon when memory is tight. Moving this check earlier (before
+	// KV cache allocation) would miss the pressure because allocations haven't
+	// happened yet; moving it later (after warmup decode) makes recovery
+	// destructive — we'd have to tear down an active inference session.
+	if validator, ok := s.model.Backend().(ml.HostPtrValidator); ok {
+		if !validator.ValidateWeights() {
+			slog.Warn("host_ptr weight validation failed -- GPU read-back mismatch, falling back to copy path",
+				"model", s.modelPath)
+			if err := validator.ForceCopyPath(); err != nil {
+				panic(fmt.Errorf("failed to reload model with copy path after validation failure: %v", err))
+			}
+			slog.Info("model reloaded with copy path after host_ptr validation failure")
 		}
 	}
 

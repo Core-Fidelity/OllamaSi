@@ -37,6 +37,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 
 	_ "github.com/ollama/ollama/llama/llama.cpp/common"
@@ -305,7 +306,10 @@ func LoadModelFromFile(modelPath string, params ModelParams) (*Model, error) {
 		cparams.progress_callback_user_data = unsafe.Pointer(&handle)
 	}
 
+	slog.Info("INSTRUMENT llama: starting LoadModelFromFile", "path", modelPath)
+	t0 := time.Now()
 	m := Model{c: C.llama_model_load_from_file(C.CString(modelPath), cparams)}
+	slog.Info("INSTRUMENT llama: LoadModelFromFile done", "path", modelPath, "elapsed", time.Since(t0).Seconds())
 	if m.c == nil {
 		return nil, fmt.Errorf("unable to load model: %s", modelPath)
 	}
@@ -318,10 +322,13 @@ func FreeModel(model *Model) {
 }
 
 func NewContextWithModel(model *Model, params ContextParams) (*Context, error) {
+	slog.Info("INSTRUMENT llama: starting NewContextWithModel")
+	t0 := time.Now()
 	c := Context{
 		c:          C.llama_init_from_model(model.c, params.c),
 		numThreads: int(params.c.n_threads),
 	}
+	slog.Info("INSTRUMENT llama: NewContextWithModel done", "elapsed", time.Since(t0).Seconds())
 	if c.c == nil {
 		return nil, errors.New("unable to create llama context")
 	}

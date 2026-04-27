@@ -87,6 +87,20 @@ func (c *WrapperCache) CopyPrefix(srcSeq, dstSeq int, len int32) {
 	}
 }
 
+func (c *WrapperCache) SetPrefixSize(seq int, size int32) {
+	for _, cache := range c.caches {
+		cache.SetPrefixSize(seq, size)
+	}
+}
+
+func (c *WrapperCache) SavePrefixData(seqId int, numKeep int32) (keys [][]byte, vals [][]byte, err error) {
+	return nil, nil, ErrNotSupported
+}
+
+func (c *WrapperCache) LoadPrefixData(seqId int, numKeep int32, keys [][]byte, vals [][]byte) error {
+	return ErrNotSupported
+}
+
 func (c *WrapperCache) CanResume(seq int, pos int32) bool {
 	for _, cache := range c.caches {
 		if !cache.CanResume(seq, pos) {

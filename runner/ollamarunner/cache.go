@@ -13,6 +13,17 @@ import (
 	"github.com/ollama/ollama/model/input"
 )
 
+// Maintain a minimum amount of host RAM after prefix-cache load succeeds.
+//
+// Percentage-based thresholds were too aggressive on 8 GB Apple Silicon
+// systems and caused successful fast-path loads to be immediately discarded,
+// forcing prompt processing back onto slower unpinned execution.
+//
+// A fixed absolute floor preserves zero-copy fallback for loads that fail
+// (ENOMEM) while keeping small-to-medium prefixes pinned when enough
+// working-set headroom remains.
+const minPrefixCacheHeadroomBytes = 300 << 20
+
 type InputCache struct {
 	// context window size (per slot)
 	numCtx int32
@@ -29,9 +40,13 @@ type InputCache struct {
 	multiUserCache bool
 
 	cache kvcache.Cache
+
+	prefixCache *PrefixCache
+	modelPath   string
+	archParams  ArchParams
 }
 
-func NewInputCache(model model.Model, kvCacheType string, kvSize int32, numSlots int, batchSize int, multiUserCache bool) (*InputCache, error) {
+func NewInputCache(model model.Model, kvCacheType string, kvSize int32, numSlots int, batchSize int, multiUserCache bool, modelPath string, archParams ArchParams, prefixCache *PrefixCache) (*InputCache, error) {
 	numCtx := kvSize / int32(numSlots)
 
 	if int(numCtx) < batchSize {
@@ -55,6 +70,9 @@ func NewInputCache(model model.Model, kvCacheType string, kvSize int32, numSlots
 		slots:          slots,
 		multiUserCache: multiUserCache,
 		cache:          cache,
+		prefixCache:    prefixCache,
+		modelPath:      modelPath,
+		archParams:     archParams,
 	}, nil
 }
 
@@ -91,9 +109,12 @@ type InputCacheSlot struct {
 
 	// last time this cache was used (as of start of processing)
 	lastUsed time.Time
+
+	// SavePrefixSize tracks a pending prefix save once the first full prefix has been computed.
+	SavePrefixSize int32
 }
 
-func (c *InputCache) LoadCacheSlot(prompt []*input.Input, cachePrompt bool) (*InputCacheSlot, []*input.Input, error) {
+func (c *InputCache) LoadCacheSlot(prompt []*input.Input, cachePrompt bool, numKeep int32) (*InputCacheSlot, []*input.Input, error) {
 	var slot *InputCacheSlot
 	var numPast int32
 	var err error
@@ -114,6 +135,8 @@ func (c *InputCache) LoadCacheSlot(prompt []*input.Input, cachePrompt bool) (*In
 	if !cachePrompt {
 		numPast = 0
 	}
+
+	slot.SavePrefixSize = 0
 
 	slot.InUse = true
 	slot.lastUsed = time.Now()
@@ -146,6 +169,28 @@ func (c *InputCache) LoadCacheSlot(prompt []*input.Input, cachePrompt bool) (*In
 			}
 			numPast = 0
 		}
+
+		// Only attempt a prefix-cache restore when we have a clean slate
+		// (no prior state in the slot). Loading a prefix over existing KV
+		// data would create a broken prefix/mutable boundary where tokens
+		// overlap. The slot must be empty before we call LoadPrefixData.
+		if c.prefixCache != nil && numKeep > 0 && numPast == 0 && len(prompt) >= int(numKeep) {
+			key := c.prefixCache.Key(c.modelPath, c.archParams, prefixInputTokens(prompt[:int(numKeep)]), numKeep)
+			keys, vals, hit, err := c.prefixCache.Load(key)
+			if err == nil && hit {
+				if available, ok := availablePrefixCacheHeadroomBytes(); ok && available < minPrefixCacheHeadroomBytes {
+					slog.Info("prefix cache skipped: insufficient headroom",
+						"available_gb", fmt.Sprintf("%.2f", float64(available)/float64(1<<30)),
+						"min_headroom_gb", fmt.Sprintf("%.2f", float64(minPrefixCacheHeadroomBytes)/float64(1<<30)))
+				} else if loadErr := c.cache.LoadPrefixData(slot.Id, numKeep, keys, vals); loadErr == nil {
+					slog.Info(fmt.Sprintf("prefix cache hit: skipping %d tokens", numKeep))
+					numPast = numKeep
+				}
+			}
+			if numPast == 0 {
+				slot.SavePrefixSize = numKeep
+			}
+		}
 	}
 
 	slog.Debug("loading cache slot", "id", slot.Id, "cache", len(slot.Inputs), "prompt", len(prompt),
@@ -155,6 +200,14 @@ func (c *InputCache) LoadCacheSlot(prompt []*input.Input, cachePrompt bool) (*In
 	prompt = prompt[numPast:]
 
 	return slot, prompt, nil
+}
+
+func prefixInputTokens(inputs []*input.Input) []int32 {
+	tokens := make([]int32, len(inputs))
+	for i, inp := range inputs {
+		tokens[i] = inp.Token
+	}
+	return tokens
 }
 
 func (c *InputCache) findLongestCacheSlot(prompt []*input.Input) (*InputCacheSlot, int32, error) {
@@ -268,14 +321,6 @@ func (c *InputCache) ShiftDiscard(inputs []*input.Input, numKeep int32) int32 {
 	return discard
 }
 
-type ErrReprocessInputs struct {
-	Inputs []*input.Input
-}
-
-func (e *ErrReprocessInputs) Error() string {
-	return fmt.Sprintf("kv cache shift not supported, inputs need reprocessing (input count: %v)", len(e.Inputs))
-}
-
 // Frees up space in the KV cache by deleting the oldest half of history and shifting
 // the newest half into that space (saving numKeep inputs at the beginning).
 //
@@ -296,22 +341,9 @@ func (c *InputCache) ShiftCacheSlot(slot *InputCacheSlot, numKeep int32) error {
 		"keep", numKeep, "discard", discard)
 
 	if c.cache != nil {
-		err := c.cache.Remove(slot.Id, numKeep, numKeep+discard)
-		if err != nil {
-			slog.Debug("kv cache removal unsupported, clearing cache and returning inputs for reprocessing",
-				"id", slot.Id, "error", err)
-
-			// Create new input slice with preserved tokens (numKeep + remaining tokens after discard)
-			newInputs := make([]*input.Input, numKeep+inputLen-(numKeep+discard))
-			copy(newInputs[:numKeep], slot.Inputs[:numKeep])
-			copy(newInputs[numKeep:], slot.Inputs[numKeep+discard:])
-
-			// Reset the cache
-			_ = c.cache.Remove(slot.Id, 0, math.MaxInt32)
-			slot.Inputs = []*input.Input{}
-
-			// Return error with inputs that need to be reprocessed
-			return &ErrReprocessInputs{Inputs: newInputs}
+		c.cache.SetPrefixSize(slot.Id, numKeep)
+		if err := c.cache.Remove(slot.Id, numKeep, numKeep+discard); err != nil {
+			return fmt.Errorf("kv cache shift failed: %w", err)
 		}
 	}
 

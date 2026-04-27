@@ -758,13 +758,20 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
     model.t_start_us = tm.t_start_us;
 
     try {
+        int64_t t_load_0 = ggml_time_us();
+
         llama_model_loader ml(fname, splits, params.use_mmap, params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
+
+        int64_t t_gguf = ggml_time_us();
+        fprintf(stderr, "INSTRUMENT load: gguf parse + tensor index took %.3f sec\n", (t_gguf - t_load_0) / 1e6);
+        fflush(stderr);
 
         ml.print_info();
 
         model.hparams.vocab_only = params.vocab_only;
         model.hparams.no_alloc   = params.no_alloc;
 
+        int64_t t_arch_0 = ggml_time_us();
         try {
             model.load_arch(ml);
         } catch(const std::exception & e) {
@@ -775,6 +782,10 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
+        int64_t t_arch_1 = ggml_time_us();
+        fprintf(stderr, "INSTRUMENT load: arch + hparams took %.3f sec\n", (t_arch_1 - t_arch_0) / 1e6);
+        fflush(stderr);
+
         if (model.arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
         }
@@ -783,6 +794,9 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
         }
+        int64_t t_vocab = ggml_time_us();
+        fprintf(stderr, "INSTRUMENT load: vocab took %.3f sec\n", (t_vocab - t_arch_1) / 1e6);
+        fflush(stderr);
 
         model.load_stats(ml);
         model.print_info();
@@ -792,9 +806,16 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
             return 0;
         }
 
+        int64_t t_tensors_0 = ggml_time_us();
         if (!model.load_tensors(ml)) {
             return -2;
         }
+        int64_t t_tensors_1 = ggml_time_us();
+        fprintf(stderr, "INSTRUMENT load: tensors took %.3f sec\n", (t_tensors_1 - t_tensors_0) / 1e6);
+        fflush(stderr);
+
+        fprintf(stderr, "INSTRUMENT load: total so far %.3f sec\n", (t_tensors_1 - t_load_0) / 1e6);
+        fflush(stderr);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
         return -1;

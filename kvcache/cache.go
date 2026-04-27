@@ -63,6 +63,17 @@ type Cache interface {
 	// CopyPrefix copies tokens in the range [0, len) from srcSeq to dstSeq
 	CopyPrefix(srcSeq, dstSeq int, len int32)
 
+	// SetPrefixSize sets the boundary for a specific sequence between immutable
+	// prefix [0, size) and mutable tail [size, ...). Prefix cells are never
+	// shifted or evicted.
+	SetPrefixSize(seq int, size int32)
+
+	// SavePrefixData extracts serialized K/V state for positions [0, numKeep).
+	SavePrefixData(seqId int, numKeep int32) (keys [][]byte, vals [][]byte, err error)
+
+	// LoadPrefixData restores serialized K/V state for positions [0, numKeep).
+	LoadPrefixData(seqId int, numKeep int32, keys [][]byte, vals [][]byte) error
+
 	// CanResume returns true if the cache can continue with the next token at
 	// the given position and sequence. Assumes that the caller has already
 	// verified the contents of the cache.

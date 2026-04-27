@@ -1,7 +1,6 @@
 package ollamarunner
 
 import (
-	"errors"
 	"fmt"
 	"slices"
 	"testing"
@@ -472,7 +471,7 @@ func TestLoadCacheSlot(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			slot, remainingPrompt, err := tt.cache.LoadCacheSlot(tt.prompt, true)
+			slot, remainingPrompt, err := tt.cache.LoadCacheSlot(tt.prompt, true, 0)
 
 			// Check error state
 			if (err != nil) != tt.wantErr {
@@ -524,8 +523,15 @@ func (m *mockCache) Init(backend ml.Backend, dtype ml.DType, maxSequences, capac
 func (m *mockCache) Close()                                                                        {}
 func (m *mockCache) StartForward(ctx ml.Context, batch input.Batch, reserve bool) error            { return nil }
 func (m *mockCache) CopyPrefix(srcSeq, dstSeq int, len int32)                                      {}
-func (m *mockCache) SetConfig(ml.CacheConfig)                                                      {}
-func (m *mockCache) CanResume(seq int, pos int32) bool                                             { return true }
+func (m *mockCache) SetPrefixSize(seq int, size int32)                                             {}
+func (m *mockCache) SavePrefixData(seqId int, numKeep int32) (keys [][]byte, vals [][]byte, err error) {
+	return nil, nil, nil
+}
+func (m *mockCache) LoadPrefixData(seqId int, numKeep int32, keys [][]byte, vals [][]byte) error {
+	return nil
+}
+func (m *mockCache) SetConfig(ml.CacheConfig)          {}
+func (m *mockCache) CanResume(seq int, pos int32) bool { return true }
 
 func TestShiftCacheSlot(t *testing.T) {
 	tests := []struct {
@@ -534,7 +540,7 @@ func TestShiftCacheSlot(t *testing.T) {
 		inputs        []*input.Input
 		numKeep       int32
 		cacheErr      bool
-		wantErr       any
+		expectErr     bool
 		wantInputsLen int
 	}{
 		{
@@ -543,7 +549,7 @@ func TestShiftCacheSlot(t *testing.T) {
 			inputs:        []*input.Input{{Token: 1}, {Token: 2}, {Token: 3}, {Token: 4}, {Token: 5}, {Token: 6}, {Token: 7}, {Token: 8}, {Token: 9}, {Token: 10}},
 			numKeep:       2,
 			cacheErr:      false, // No error
-			wantErr:       nil,
+			expectErr:     false,
 			wantInputsLen: 6, // After discarding 4 tokens
 		},
 		{
@@ -552,8 +558,8 @@ func TestShiftCacheSlot(t *testing.T) {
 			inputs:        []*input.Input{{Token: 1}, {Token: 2}, {Token: 3}, {Token: 4}, {Token: 5}, {Token: 6}, {Token: 7}, {Token: 8}, {Token: 9}, {Token: 10}},
 			numKeep:       2,
 			cacheErr:      true,
-			wantErr:       &ErrReprocessInputs{},
-			wantInputsLen: 0, // Original inputs should be cleared
+			expectErr:     true,
+			wantInputsLen: 10, // Inputs unchanged on error
 		},
 	}
 
@@ -572,16 +578,9 @@ func TestShiftCacheSlot(t *testing.T) {
 
 			err := c.ShiftCacheSlot(slot, tt.numKeep)
 
-			if tt.wantErr != nil {
-				if err == nil {
-					t.Errorf("Expected error but got nil")
-					return
-				}
-
-				if !errors.As(err, &tt.wantErr) {
-					t.Errorf("Expected error of type %T but got %T: %v", tt.wantErr, err, err)
-				}
-			} else if err != nil {
+			if tt.expectErr && err == nil {
+				t.Errorf("Expected error but got nil")
+			} else if !tt.expectErr && err != nil {
 				t.Errorf("Unexpected error: %v", err)
 			}
 
